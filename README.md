@@ -1,22 +1,36 @@
 # ChatGPT Gateway
 
-Browser extension + local server that turns your logged-in ChatGPT session into an OpenAI-compatible API.
+Use ChatGPT from any code, script, or tool — without an API key.
 
-No API keys needed — uses your existing ChatGPT subscription through browser automation.
+This is a browser extension paired with a tiny local server that exposes your **logged-in ChatGPT session** as a standard OpenAI-compatible API at `localhost:18790`. Any application that speaks the OpenAI chat completions format can use it out of the box — just swap the base URL.
+
+**Why?** OpenAI API access requires a separate paid plan and API keys. If you already have a ChatGPT subscription (Free, Plus, or Team), this tool lets you use it programmatically. It automates the ChatGPT web interface through your browser — exactly like you would manually, but from code.
 
 ![ChatGPT Gateway Icon](icons/icon128.png)
 
 ## How it works
 
 ```
-Your app / curl / any OpenAI client
-        ↓ HTTP
-Gateway server (localhost:18790)
+Your app / curl / any OpenAI-compatible client
+        ↓ HTTP POST (localhost:18790)
+Local gateway server (Node.js)
         ↓ WebSocket
-Browser extension
-        ↓ DOM automation
-ChatGPT (your logged-in session)
+Browser extension (background worker)
+        ↓ chrome.tabs message
+Content script on chatgpt.com
+        ↓ DOM automation (type → send → read response)
+ChatGPT (your logged-in browser session)
 ```
+
+The extension's content script types your message into ChatGPT's input field, clicks send, waits for the response to finish streaming, extracts the text, and returns it through the chain. The gateway server wraps the result in an OpenAI-compatible JSON response.
+
+## Can I keep using my browser?
+
+**Yes.** The extension only interacts with the ChatGPT tab. All other tabs work normally. You can browse, work, watch videos — whatever you want.
+
+The only rule: **don't manually type in the ChatGPT tab while a request is in progress.** The content script is actively using that tab's input field and reading the response DOM. Between requests, you can use ChatGPT manually as usual.
+
+You do **not** need a separate browser profile or window. Your everyday Chrome or Firefox works fine.
 
 ## Setup
 
@@ -24,7 +38,7 @@ ChatGPT (your logged-in session)
 
 **Chrome:**
 1. Go to `chrome://extensions`
-2. Enable **Developer mode**
+2. Enable **Developer mode** (toggle in top-right)
 3. Click **Load unpacked** → select this repo's root directory
 
 **Firefox:**
@@ -40,7 +54,7 @@ npm start
 
 ### 3. Open ChatGPT
 
-Navigate to [chatgpt.com](https://chatgpt.com) and make sure you're logged in. The extension popup will show green status when everything is connected.
+Navigate to [chatgpt.com](https://chatgpt.com) and make sure you're logged in. Click the extension icon to verify — both dots should be green.
 
 ## Usage
 
@@ -84,15 +98,20 @@ console.log(response.choices[0].message.content);
 
 OpenAI-compatible chat completions endpoint.
 
-| Field | Type | Description |
-|---|---|---|
-| `messages` | array | Array of `{role, content}` message objects |
-| `model` | string | Model hint for ChatGPT's model picker (default: `"auto"`) |
-| `new_conversation` | boolean | Start a new chat (default: `true`) |
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `messages` | array | required | Array of `{role, content}` message objects |
+| `model` | string | `"auto"` | Model hint — attempts to select via ChatGPT's model picker |
+| `new_conversation` | boolean | `true` | Start a fresh chat for each request |
+| `timeout` | number | `180000` | Max wait time in ms for ChatGPT to respond |
+
+Response format matches the [OpenAI Chat Completions API](https://platform.openai.com/docs/api-reference/chat/create).
 
 ### `GET /health`
 
-Returns gateway status and extension connection state.
+```json
+{"status": "ok", "extensionConnected": true}
+```
 
 ## Project structure
 
@@ -101,17 +120,24 @@ Returns gateway status and extension connection state.
 ├── manifest.firefox.json   # Firefox extension manifest (MV3)
 ├── background.js           # Service worker — WebSocket bridge to gateway
 ├── content.js              # Content script — ChatGPT DOM automation
-├── popup.html/js           # Extension popup — connection status
+├── popup.html / popup.js   # Extension popup — connection status UI
 ├── server.mjs              # Gateway HTTP + WebSocket server
-├── icons/                  # Extension icons
+├── icons/                  # Extension icons (16/32/48/128px)
 └── package.json            # Server dependencies
 ```
+
+## Limitations
+
+- **One request at a time.** The extension automates a single ChatGPT tab, so requests are serialized. Concurrent requests will queue on the server side.
+- **No streaming.** Responses are returned after ChatGPT finishes generating. Streaming support may come later.
+- **DOM-dependent.** If ChatGPT significantly changes its UI, the content script selectors may need updating.
+- **Session-bound.** If your ChatGPT session expires, refresh the tab or re-login.
 
 ## Requirements
 
 - Node.js 18+
 - Chrome or Firefox
-- Active ChatGPT session (free or Plus)
+- Active ChatGPT session (Free, Plus, or Team)
 
 ## License
 
