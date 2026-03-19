@@ -4,13 +4,13 @@
   "version": "1.0.0",
   "description": "Local API gateway for ChatGPT — automates your logged-in session",
   "permissions": ["activeTab", "scripting", "alarms"],
-  "host_permissions": ["https://chatgpt.com/*"],
+  "host_permissions": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
   "background": {
     "service_worker": "background.js"
   },
   "content_scripts": [
     {
-      "matches": ["https://chatgpt.com/*"],
+      "matches": ["https://chatgpt.com/*", "https://chat.openai.com/*"],
       "js": ["content.js"],
       "run_at": "document_idle"
     }

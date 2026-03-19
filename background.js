@@ -69,7 +69,7 @@ function sendToServer(data) {
 
 async function handleChatMessage(msg) {
   // Find a ChatGPT tab
-  const tabs = await chrome.tabs.query({ url: "https://chatgpt.com/*" });
+  const tabs = await chrome.tabs.query({ url: ["https://chatgpt.com/*", "https://chat.openai.com/*"] });
 
   if (tabs.length === 0) {
     sendToServer({
@@ -80,8 +80,6 @@ async function handleChatMessage(msg) {
     });
     return;
   }
-
-  const tab = tabs[0];
 
   // Extract the last user message
   const messages = msg.messages || [];
@@ -98,29 +96,37 @@ async function handleChatMessage(msg) {
     return;
   }
 
-  try {
-    const response = await chrome.tabs.sendMessage(tab.id, {
-      type: "chat",
-      model: msg.model,
-      userMessage,
-      newConversation: msg.newConversation !== false,
-    });
+  // Try each tab until one responds (handles multiple ChatGPT tabs)
+  const errors = [];
+  for (const tab of tabs) {
+    try {
+      const response = await chrome.tabs.sendMessage(tab.id, {
+        type: "chat",
+        model: msg.model,
+        userMessage,
+        newConversation: msg.newConversation !== false,
+      });
 
-    sendToServer({
-      type: "response",
-      requestId: msg.requestId,
-      ok: response.ok,
-      content: response.content || "",
-      error: response.error || "",
-    });
-  } catch (err) {
-    sendToServer({
-      type: "response",
-      requestId: msg.requestId,
-      ok: false,
-      error: `Extension error: ${err.message}. Make sure chatgpt.com is open and refresh the page.`,
-    });
+      sendToServer({
+        type: "response",
+        requestId: msg.requestId,
+        ok: response.ok,
+        content: response.content || "",
+        error: response.error || "",
+      });
+      return; // Success — stop trying other tabs
+    } catch (err) {
+      errors.push(`Tab ${tab.id}: ${err.message}`);
+    }
   }
+
+  // All tabs failed
+  sendToServer({
+    type: "response",
+    requestId: msg.requestId,
+    ok: false,
+    error: `No ChatGPT tab responded (${tabs.length} tab(s) tried). Refresh chatgpt.com.\n${errors.join("\n")}`,
+  });
 }
 
 // Connect on startup
