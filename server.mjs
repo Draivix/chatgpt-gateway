@@ -40,6 +40,17 @@ wss.on("connection", (ws) => {
   });
 });
 
+// ── Helpers ────────────────────────────────────────────────
+
+function cleanupRequest(requestId) {
+  const entry = pending.get(requestId);
+  if (entry) {
+    clearTimeout(entry.timer);
+    pending.delete(requestId);
+    entry.reject(new Error("Client disconnected"));
+  }
+}
+
 // ── HTTP server ────────────────────────────────────────────
 
 const server = createServer(async (req, res) => {
@@ -64,8 +75,19 @@ const server = createServer(async (req, res) => {
       JSON.stringify({
         status: "ok",
         extensionConnected: !!extensionWs,
+        pendingRequests: pending.size,
       })
     );
+    return;
+  }
+
+  // Cancel a pending request
+  if (req.method === "DELETE" && req.url?.startsWith("/v1/requests/")) {
+    const requestId = req.url.split("/").pop();
+    const had = pending.has(requestId);
+    cleanupRequest(requestId);
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ cancelled: had }));
     return;
   }
 
@@ -95,7 +117,7 @@ const server = createServer(async (req, res) => {
     }
 
     const requestId = crypto.randomUUID();
-    const timeoutMs = parseInt(payload.timeout || "180000", 10);
+    const timeoutMs = parseInt(payload.timeout || "90000", 10);
 
     const promise = new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -103,6 +125,14 @@ const server = createServer(async (req, res) => {
         reject(new Error("Timeout waiting for ChatGPT response"));
       }, timeoutMs);
       pending.set(requestId, { resolve, reject, timer });
+    });
+
+    // Clean up if the HTTP client disconnects (e.g. MCP cancellation aborts fetch)
+    req.on("close", () => {
+      if (pending.has(requestId)) {
+        console.log(`[gateway] Client disconnected, cleaning up ${requestId}`);
+        cleanupRequest(requestId);
+      }
     });
 
     // Send to extension
@@ -118,6 +148,8 @@ const server = createServer(async (req, res) => {
 
     try {
       const result = await promise;
+
+      if (res.writableEnded) return; // Client already gone
 
       if (!result.ok) {
         res.writeHead(500, { "Content-Type": "application/json" });
@@ -147,6 +179,7 @@ const server = createServer(async (req, res) => {
         })
       );
     } catch (err) {
+      if (res.writableEnded) return; // Client already gone
       res.writeHead(504, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: err.message }));
     }
