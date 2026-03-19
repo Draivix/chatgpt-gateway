@@ -1,0 +1,16 @@
+{
+  "name": "chatgpt-gateway-mcp",
+  "version": "1.0.0",
+  "description": "MCP server that uses ChatGPT via browser gateway — no API key needed",
+  "type": "module",
+  "license": "MIT",
+  "bin": {
+    "chatgpt-gateway-mcp": "./index.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  }
+}

@@ -113,6 +113,40 @@ Response format matches the [OpenAI Chat Completions API](https://platform.opena
 {"status": "ok", "extensionConnected": true}
 ```
 
+## MCP Server
+
+The `mcp/` directory contains a [Model Context Protocol](https://modelcontextprotocol.io) server that wraps the gateway. This lets AI tools like Claude Code use ChatGPT directly as a tool.
+
+### Install
+
+```bash
+cd mcp && npm install
+```
+
+### Configure (Claude Code)
+
+Add to your MCP settings (`~/.claude/settings.json` or project `.claude/settings.json`):
+
+```json
+{
+  "mcpServers": {
+    "chatgpt": {
+      "command": "node",
+      "args": ["/path/to/chatgpt-gateway/mcp/index.mjs"]
+    }
+  }
+}
+```
+
+### Tools
+
+| Tool | Description |
+|---|---|
+| `chatgpt_status` | Check if the gateway is running and extension is connected |
+| `chatgpt_ask` | Send a message to ChatGPT and get the response (10-120s, sends progress notifications) |
+
+The `chatgpt_ask` tool supports progress notifications per the MCP spec — clients will see status updates like "Typing message...", "Waiting for response..." while ChatGPT processes the request.
+
 ## Project structure
 
 ```
@@ -123,7 +157,10 @@ Response format matches the [OpenAI Chat Completions API](https://platform.opena
 ├── popup.html / popup.js   # Extension popup — connection status UI
 ├── server.mjs              # Gateway HTTP + WebSocket server
 ├── icons/                  # Extension icons (16/32/48/128px)
-└── package.json            # Server dependencies
+├── package.json            # Server dependencies
+└── mcp/                    # MCP server
+    ├── index.mjs           # MCP stdio server
+    └── package.json        # MCP dependencies
 ```
 
 ## Limitations
