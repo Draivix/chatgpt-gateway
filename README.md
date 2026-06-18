@@ -1,5 +1,11 @@
 # ChatGPT Gateway
 
+> **Optimized successor:** for smooth ChatGPT **Pro** (extended thinking) access without
+> a manual browser tab, see [`camoufox-gateway/`](camoufox-gateway/) — a headless Camoufox
+> (stealth Firefox) with a persistent logged-in profile, auto-login, robust
+> response-completion, exposed as a Claude Code skill + MCP. This extension still works
+> for quick use in your everyday browser.
+
 Use ChatGPT from any code, script, or tool — without an API key.
 
 This is a browser extension paired with a tiny local server that exposes your **logged-in ChatGPT session** as a standard OpenAI-compatible API at `localhost:18790`. Any application that speaks the OpenAI chat completions format can use it out of the box — just swap the base URL.
