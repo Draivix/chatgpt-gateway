@@ -1,0 +1,20 @@
+{
+  "_comment": "Copy to ~/.config/cgw/accounts.json (chmod 600) and fill in real values, OR point CGW_ACCOUNTS_FILE at your own file. NEVER commit the real one. 'password' is your ChatGPT/OpenAI login password; imap_* is the mailbox that receives the OpenAI email login codes (defaults to the same as email/password if omitted).",
+  "imap": {
+    "host": "mail.example.com",
+    "port": 993,
+    "ssl": true
+  },
+  "accounts": {
+    "default": {
+      "email": "you@example.com",
+      "password": "YOUR_CHATGPT_PASSWORD",
+      "imap_user": "you@example.com",
+      "imap_password": "YOUR_MAILBOX_PASSWORD"
+    },
+    "second": {
+      "email": "you2@example.com",
+      "password": "YOUR_CHATGPT_PASSWORD_2"
+    }
+  }
+}

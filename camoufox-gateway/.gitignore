@@ -1,0 +1,12 @@
+# persistent browser profiles hold live ChatGPT session cookies — NEVER commit
+profile/
+# debug artifacts (screenshots/html dumps from login flow)
+debug/
+# generated Firefox addon (rebuilt from the extension at launch)
+addon-build/
+*.log
+# python
+.venv/
+__pycache__/
+*.pyc
+uv.lock

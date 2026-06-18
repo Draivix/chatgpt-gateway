@@ -1,0 +1,278 @@
+"""Drive a ChatGPT conversation on a logged-in Camoufox page.
+
+The smoothness fix: completion is detected by the backend SSE stream
+(``POST /backend-api/f/conversation``, content-type text/event-stream) closing —
+authoritative and CSP-immune — with a DOM signal (stop-button gone +
+copy-turn-action-button present) as a parallel fallback. No fragile text-stability
+heuristic, generous timeout for extended thinking.
+
+Validated against the live DOM (June 2026 chatgpt.com, Czech locale) via ``cgw probe``.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import time
+
+from .login import is_logged_in
+
+CHATGPT_NEW = "https://chatgpt.com/"
+
+# Reasoning effort levels (Czech UI labels in the Ctrl+Shift+M menu), low -> high.
+# Top level "Pro" has its own sub-intensity submenu (Pro Standardní / Pro rozšířené).
+EFFORT_MAP = {
+    "instant": "Okamžitá",
+    "standard": "Střední",
+    "medium": "Střední",
+    "high": "Vysoká",
+    "extended": "Velmi vysoká",
+    "very-high": "Velmi vysoká",
+}
+# GPT-5.5 Pro sub-intensities. Default "pro" = the deepest (Pro rozšířené = Pro Extended).
+PRO_SUB = {
+    "pro": "Pro rozšířené",
+    "pro-extended": "Pro rozšířené",
+    "pro-max": "Pro rozšířené",
+    "pro-standard": "Pro Standardní",
+}
+PRO_TRIGGER = '[data-testid="composer-intelligence-pro-thinking-effort-trigger"]'
+
+SEL = {
+    "composer": "#prompt-textarea",
+    "send": '[data-testid="send-button"], #composer-submit-button',
+    "stop": ('button[data-testid="stop-button"], button[aria-label*="Stop" i], '
+             'button[aria-label*="Zastav" i]'),
+    "assistant": '[data-message-author-role="assistant"]',
+    "assistant_md": '[data-message-author-role="assistant"] .markdown',
+    "done_marker": '[data-testid="copy-turn-action-button"]',
+    "new_chat": ('[data-testid="create-new-chat-button"], a[href="/"]'),
+}
+
+
+def log(msg: str) -> None:
+    print(f"[chat {time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def _is_conversation_sse(resp) -> bool:
+    try:
+        if resp.request.method != "POST":
+            return False
+        url = resp.url.split("?", 1)[0].rstrip("/")
+        return url.endswith("/backend-api/f/conversation")
+    except Exception:
+        return False
+
+
+async def new_chat(page) -> None:
+    try:
+        btn = page.locator(SEL["new_chat"]).first
+        if await btn.count() and await btn.is_visible(timeout=2000):
+            await btn.click()
+            await page.wait_for_timeout(700)
+            await page.wait_for_selector(SEL["composer"], timeout=15_000)
+            return
+    except Exception:
+        pass
+    await page.goto(CHATGPT_NEW, wait_until="domcontentloaded")
+    await page.wait_for_selector(SEL["composer"], timeout=20_000)
+
+
+async def _escape(page, n: int = 2) -> None:
+    for _ in range(n):
+        try:
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(120)
+        except Exception:
+            return
+
+
+async def _open_effort_menu(page) -> None:
+    await page.locator(SEL["composer"]).first.click()
+    await page.keyboard.press("Control+Shift+m")
+    await page.wait_for_timeout(700)
+
+
+async def set_effort(page, effort: str) -> str:
+    """Open the reasoning-effort menu (Ctrl+Shift+M) and pick the level.
+
+    Handles GPT-5.5 Pro's sub-intensity submenu (Pro Standardní / Pro rozšířené).
+    Returns the chosen label (best-effort; never raises).
+    """
+    effort = (effort or "").lower()
+    try:
+        # ── Pro modes: main "Pro" + sub-intensity ──
+        if effort in PRO_SUB:
+            sub = PRO_SUB[effort]
+            await _open_effort_menu(page)
+            pro = page.get_by_role("menuitemradio", name=re.compile(r"^Pro$")).first
+            if not await pro.count():
+                await _escape(page)
+                return "pro-not-found"
+            await pro.hover()
+            await page.wait_for_timeout(300)
+            trig = page.locator(PRO_TRIGGER).first
+            if await trig.count():
+                await trig.click(force=True)
+                await page.wait_for_timeout(500)
+                subradio = page.get_by_role(
+                    "menuitemradio", name=re.compile(re.escape(sub))).first
+                if await subradio.count():
+                    if (await subradio.get_attribute("aria-checked")) != "true":
+                        await subradio.click()
+                        await page.wait_for_timeout(400)
+                    await _escape(page)
+                    return f"Pro · {sub}"
+            # fallback: select plain Pro (Standard) if submenu unavailable
+            if (await pro.get_attribute("aria-checked")) != "true":
+                await pro.click()
+                await page.wait_for_timeout(400)
+            await _escape(page)
+            return "Pro"
+
+        # ── plain levels ──
+        label = EFFORT_MAP.get(effort)
+        if not label:
+            return "default"
+        await _open_effort_menu(page)
+        radio = page.get_by_role("menuitemradio", name=re.compile(re.escape(label))).first
+        if not await radio.count():
+            await _escape(page)
+            return f"label-not-found:{label}"
+        if (await radio.get_attribute("aria-checked")) != "true":
+            await radio.click()
+            await page.wait_for_timeout(400)
+        await _escape(page)
+        return label
+    except Exception as e:  # noqa: BLE001
+        log(f"set_effort failed: {e}")
+        await _escape(page)
+        return "error"
+
+
+async def _send(page, text: str) -> None:
+    composer = page.locator(SEL["composer"]).first
+    await composer.click()
+    try:
+        await composer.fill(text)
+    except Exception:
+        await composer.type(text, delay=2)
+    await page.wait_for_timeout(250)
+    # Enter submits in the ChatGPT composer (the send button is overlaid by its
+    # tooltip and intercepts pointer clicks); force-click is the fallback.
+    try:
+        await composer.press("Enter")
+    except Exception:
+        await page.locator(SEL["send"]).first.click(force=True)
+
+
+async def _extract_latest(page) -> str:
+    """Clean text of the latest assistant message (drops KaTeX's hidden MathML twin)."""
+    try:
+        return (await page.evaluate(r"""() => {
+          const md = document.querySelectorAll('[data-message-author-role=assistant] .markdown');
+          if (md.length) {
+            const el = md[md.length - 1].cloneNode(true);
+            el.querySelectorAll('.katex-mathml').forEach(n => n.remove());
+            return (el.innerText || '').trim();
+          }
+          const a = document.querySelectorAll('[data-message-author-role=assistant]');
+          return a.length ? (a[a.length - 1].innerText || '').trim() : '';
+        }""")).strip()
+    except Exception:
+        md = page.locator(SEL["assistant_md"]).last
+        if await md.count():
+            return (await md.inner_text()).strip()
+        return ""
+
+
+async def _count(page, sel: str) -> int:
+    try:
+        return await page.locator(sel).count()
+    except Exception:
+        return 0
+
+
+async def _wait_complete(page, timeout_s: int, progress) -> None:
+    """Return when generation finishes, judged from the DOM.
+
+    The ``/f/conversation`` SSE closes early (generation then streams over a
+    websocket), so the authoritative signal is the Stop button: it is present for
+    the whole turn (thinking + answering) and disappears when done. Confirmed by
+    the answer's copy action button / stable text.
+    """
+    deadline = time.time() + timeout_s
+    # Phase 1: wait for the turn to START (Stop button appears), up to 120s.
+    start_deadline = min(deadline, time.time() + 120)
+    gen_started = False
+    while time.time() < start_deadline:
+        if await _count(page, SEL["stop"]):
+            gen_started = True
+            break
+        if await _count(page, SEL["assistant_md"]) and await _extract_latest(page):
+            break
+        await asyncio.sleep(0.5)
+    if gen_started and progress:
+        progress("thinking…")
+
+    # Phase 2: wait for completion — Stop gone, answer text present + settled.
+    last, stable = "", 0
+    while time.time() < deadline:
+        if await _count(page, SEL["stop"]):
+            await asyncio.sleep(0.8)
+            continue
+        txt = await _extract_latest(page)
+        if txt:
+            stable = stable + 1 if txt == last else 0
+            last = txt
+            if await _count(page, SEL["done_marker"]) or stable >= 2:
+                return
+        await asyncio.sleep(0.7)
+
+
+async def ask(page, prompt: str, *, effort: str = "pro",
+              system: str | None = None, timeout_s: int = 1200,
+              progress=None) -> dict:
+    """Send a prompt and return {ok, text, model/effort, elapsed}. Serialized by daemon."""
+    t0 = time.time()
+    if not await is_logged_in(page):
+        return {"ok": False, "error": "not logged in"}
+
+    def _p(msg):
+        if progress:
+            try:
+                progress(msg)
+            except Exception:
+                pass
+
+    try:
+        _p("starting new chat")
+        await new_chat(page)
+        label = await set_effort(page, effort)
+        _p(f"effort: {label}")
+
+        msg = f"{system}\n\n{prompt}" if system else prompt
+        await _send(page, msg)
+        _p("sent; waiting for response (extended thinking can take minutes)")
+
+        await _wait_complete(page, timeout_s, _p)
+
+        text = ""
+        for _ in range(16):
+            await page.wait_for_timeout(400)
+            streaming = await _count(page, SEL["stop"])
+            text = await _extract_latest(page)
+            if text and not streaming:
+                break
+        if not text:
+            text = await _extract_latest(page)
+        if not text:
+            return {"ok": False, "error": "no response captured",
+                    "elapsed": round(time.time() - t0, 1)}
+
+        elapsed = round(time.time() - t0, 1)
+        _p(f"done in {elapsed}s")
+        return {"ok": True, "text": text, "effort": label, "elapsed": elapsed}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}",
+                "elapsed": round(time.time() - t0, 1)}

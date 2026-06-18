@@ -1,0 +1,22 @@
+[Unit]
+Description=Camoufox ChatGPT-Pro gateway daemon (smooth extended-thinking access)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# %h = your home dir. Adjust if you cloned elsewhere or installed uv to another path.
+WorkingDirectory=%h/chatgpt-gateway/camoufox-gateway
+# Put your real CGW_ACCOUNT / CGW_ACCOUNTS_FILE here (optional; '-' = ignore if missing):
+EnvironmentFile=-%h/.config/cgw/cgw.env
+Environment=CGW_ACCOUNT=default
+# Headless Camoufox (Firefox -headless) needs no X server. If your build insists on
+# a display, prefix ExecStart with:  /usr/bin/xvfb-run -a
+ExecStart=%h/.local/bin/uv run --project %h/chatgpt-gateway/camoufox-gateway cgw serve
+Restart=always
+RestartSec=5
+# give a long stop timeout so an in-flight extended-thinking answer can finish
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
