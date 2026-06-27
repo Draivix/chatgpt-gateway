@@ -12,6 +12,7 @@ Validated against the live DOM (June 2026 chatgpt.com, Czech locale) via ``cgw p
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 import time
 
@@ -150,19 +151,66 @@ async def set_effort(page, effort: str) -> str:
         return "error"
 
 
-async def _send(page, text: str) -> None:
+async def _composer_text(page) -> str:
+    """Current text in the ProseMirror composer (empty string if blank/missing)."""
+    try:
+        return (await page.locator(SEL["composer"]).first.inner_text()).strip()
+    except Exception:
+        return ""
+
+
+async def _enter_text(page, text: str) -> bool:
+    """Put ``text`` into the contenteditable composer and VERIFY it landed.
+
+    The composer is a ProseMirror contenteditable div; after the effort menu
+    (Ctrl+Shift+M) focus can be lost, so a blind ``fill`` silently no-ops and the
+    prompt is never pasted ("refreshing but not pasting"). We dismiss menus, retry
+    a few ways, and confirm non-empty before returning.
+    """
     composer = page.locator(SEL["composer"]).first
-    await composer.click()
-    try:
-        await composer.fill(text)
-    except Exception:
-        await composer.type(text, delay=2)
-    await page.wait_for_timeout(250)
-    # Enter submits in the ChatGPT composer (the send button is overlaid by its
-    # tooltip and intercepts pointer clicks); force-click is the fallback.
-    try:
-        await composer.press("Enter")
-    except Exception:
+    for _ in range(4):
+        await _escape(page, 2)               # close any lingering menu/overlay
+        try:
+            await composer.click()
+        except Exception:
+            pass
+        try:
+            await composer.fill("")
+            await composer.fill(text)
+        except Exception:
+            try:
+                await composer.click()
+                await page.keyboard.insert_text(text)
+            except Exception:
+                with contextlib.suppress(Exception):
+                    await composer.type(text[:6000], delay=1)
+        await page.wait_for_timeout(200)
+        if await _composer_text(page):
+            return True
+    # last resort: raw keyboard insert into the focused element
+    with contextlib.suppress(Exception):
+        await composer.click()
+        await page.keyboard.insert_text(text)
+        await page.wait_for_timeout(150)
+    return bool(await _composer_text(page))
+
+
+async def _send(page, text: str) -> None:
+    if not await _enter_text(page, text):
+        log("WARN composer stayed empty after retries; submitting anyway")
+    await page.wait_for_timeout(150)
+    # Submit, then confirm the composer cleared (= the message actually left the
+    # box). Enter is primary; the send button (overlaid by its tooltip) is fallback.
+    for _ in range(3):
+        try:
+            await page.locator(SEL["composer"]).first.press("Enter")
+        except Exception:
+            with contextlib.suppress(Exception):
+                await page.locator(SEL["send"]).first.click(force=True)
+        await page.wait_for_timeout(450)
+        if not await _composer_text(page):
+            return  # sent
+    with contextlib.suppress(Exception):
         await page.locator(SEL["send"]).first.click(force=True)
 
 
@@ -193,13 +241,17 @@ async def _count(page, sel: str) -> int:
         return 0
 
 
-async def _wait_complete(page, timeout_s: int, progress) -> None:
+async def _wait_complete(page, timeout_s: int, progress, prior_count: int = 0) -> None:
     """Return when generation finishes, judged from the DOM.
 
     The ``/f/conversation`` SSE closes early (generation then streams over a
     websocket), so the authoritative signal is the Stop button: it is present for
     the whole turn (thinking + answering) and disappears when done. Confirmed by
     the answer's copy action button / stable text.
+
+    ``prior_count`` = number of assistant messages already present before this
+    turn was sent (non-zero on a continued conversation). Phase 1 must wait for a
+    NEW assistant message (count > prior_count), not break on a pre-existing one.
     """
     deadline = time.time() + timeout_s
     # Phase 1: wait for the turn to START (Stop button appears), up to 120s.
@@ -209,7 +261,8 @@ async def _wait_complete(page, timeout_s: int, progress) -> None:
         if await _count(page, SEL["stop"]):
             gen_started = True
             break
-        if await _count(page, SEL["assistant_md"]) and await _extract_latest(page):
+        # Only treat as "started/answered" when a NEW assistant message exists.
+        if await _count(page, SEL["assistant_md"]) > prior_count and await _extract_latest(page):
             break
         await asyncio.sleep(0.5)
     if gen_started and progress:
@@ -232,8 +285,13 @@ async def _wait_complete(page, timeout_s: int, progress) -> None:
 
 async def ask(page, prompt: str, *, effort: str = "pro",
               system: str | None = None, timeout_s: int = 1200,
-              progress=None) -> dict:
-    """Send a prompt and return {ok, text, model/effort, elapsed}. Serialized by daemon."""
+              progress=None, cont: bool = False) -> dict:
+    """Send a prompt and return {ok, text, model/effort, elapsed}. Serialized by daemon.
+
+    ``cont=True`` continues the CURRENT conversation (does not start a new chat),
+    so prior turns stay in context. Multi-turn dialogue: first call cont=False,
+    follow-ups cont=True. Either way only the latest assistant message is returned.
+    """
     t0 = time.time()
     if not await is_logged_in(page):
         return {"ok": False, "error": "not logged in"}
@@ -246,16 +304,29 @@ async def ask(page, prompt: str, *, effort: str = "pro",
                 pass
 
     try:
-        _p("starting new chat")
-        await new_chat(page)
-        label = await set_effort(page, effort)
-        _p(f"effort: {label}")
+        if cont:
+            # Continue the existing conversation: ensure a composer is present
+            # (do NOT reset the thread). Effort persists from the prior turn.
+            _p("continuing conversation")
+            try:
+                await page.wait_for_selector(SEL["composer"], timeout=15_000)
+            except Exception:
+                # No live conversation to continue -> fall back to a fresh chat.
+                await new_chat(page)
+                await set_effort(page, effort)
+            label = "continue"
+        else:
+            _p("starting new chat")
+            await new_chat(page)
+            label = await set_effort(page, effort)
+            _p(f"effort: {label}")
 
+        prior_count = await _count(page, SEL["assistant_md"])
         msg = f"{system}\n\n{prompt}" if system else prompt
         await _send(page, msg)
         _p("sent; waiting for response (extended thinking can take minutes)")
 
-        await _wait_complete(page, timeout_s, _p)
+        await _wait_complete(page, timeout_s, _p, prior_count)
 
         text = ""
         for _ in range(16):

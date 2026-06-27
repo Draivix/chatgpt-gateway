@@ -32,6 +32,19 @@ ACCOUNTS_FILE = Path(
 # Which account key (from accounts.json) to use by default. Override with CGW_ACCOUNT.
 DEFAULT_ACCOUNT = os.environ.get("CGW_ACCOUNT", "default")
 
+
+def _envbool(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on")
+
+
+# Run the browser with a visible window? Default headless (background daemon). Set
+# CGW_HEADED=true (e.g. in ~/.config/cgw/cgw.env) to watch it; --headed/--headless
+# on the CLI override this per-invocation.
+HEADED = _envbool("CGW_HEADED", False)
+
 # Loopback HTTP API the MCP server talks to.
 DAEMON_HOST = os.environ.get("CGW_HOST", "127.0.0.1")
 DAEMON_PORT = int(os.environ.get("CGW_PORT", "18791"))
@@ -41,6 +54,19 @@ CHATGPT_URL = "https://chatgpt.com/"
 
 # Extended-thinking responses can run many minutes; be generous.
 ASK_TIMEOUT_S = int(os.environ.get("CGW_ASK_TIMEOUT", "1200"))  # 20 min hard cap
+
+# Number of browser windows the daemon drives in parallel. NOTE: Playwright-Firefox
+# opens each page as a separate WINDOW (not a tab), and N concurrent ChatGPT windows
+# on one account is heavy + trips slow cold-loads, so the default is 1: the job queue
+# already serializes concurrent agents so they don't collide, and the reliability +
+# watchdog fixes make each job dependable. Raise CGW_WORKERS only if you accept N
+# windows + the rate-limit exposure.
+WORKERS = max(1, int(os.environ.get("CGW_WORKERS", "1")))
+
+# Navigation/action timeouts. chatgpt.com is a heavy SPA that under a headed cold
+# start can take well over the Playwright 30s default to reach domcontentloaded.
+NAV_TIMEOUT_MS = int(os.environ.get("CGW_NAV_TIMEOUT_MS", "60000"))
+ACTION_TIMEOUT_MS = int(os.environ.get("CGW_ACTION_TIMEOUT_MS", "45000"))
 
 
 def profile_dir(account: str) -> Path:
