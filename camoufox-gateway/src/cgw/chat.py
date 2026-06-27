@@ -94,6 +94,26 @@ async def _open_effort_menu(page) -> None:
     await page.wait_for_timeout(700)
 
 
+# Effort indicator shown in the composer toolbar (the "Vysoká" / "Pro rozšířené"
+# dropdown). Used to VERIFY a selection actually took (not just clicked a menu item).
+_EFFORT_LABELS = ["Okamžitá", "Střední", "Vysoká", "Velmi vysoká",
+                  "Pro rozšířené", "Pro Standardní"]
+
+
+async def _current_effort_label(page) -> str:
+    try:
+        return (await page.evaluate(
+            r"""(labels) => {
+              for (const b of document.querySelectorAll('button, [role=button]')) {
+                const t = (b.innerText || '').trim();
+                if (labels.some(l => t === l || t.startsWith(l))) return t;
+              }
+              return '';
+            }""", _EFFORT_LABELS)).strip()
+    except Exception:
+        return ""
+
+
 async def set_effort(page, effort: str) -> str:
     """Open the reasoning-effort menu (Ctrl+Shift+M) and pick the level.
 
@@ -102,34 +122,51 @@ async def set_effort(page, effort: str) -> str:
     """
     effort = (effort or "").lower()
     try:
-        # ── Pro modes: main "Pro" + sub-intensity ──
+        # ── Pro modes: main "Pro" group + sub-intensity submenu ──
         if effort in PRO_SUB:
-            sub = PRO_SUB[effort]
-            await _open_effort_menu(page)
-            pro = page.get_by_role("menuitemradio", name=re.compile(r"^Pro$")).first
-            if not await pro.count():
-                await _escape(page)
-                return "pro-not-found"
-            await pro.hover()
-            await page.wait_for_timeout(300)
-            trig = page.locator(PRO_TRIGGER).first
-            if await trig.count():
-                await trig.click(force=True)
-                await page.wait_for_timeout(500)
-                subradio = page.get_by_role(
+            sub = PRO_SUB[effort]  # e.g. "Pro rozšířené"
+            cur = ""
+            for attempt in range(3):
+                await _open_effort_menu(page)
+                # The top-level Pro group's label reflects its current sub-mode
+                # ("Pro Standardní" / "Pro rozšířené"), so a "^Pro$" match never hits
+                # — match "Pro <word>" (or fall back to the submenu trigger element).
+                pro = page.get_by_role("menuitemradio", name=re.compile(r"^Pro\s")).first
+                if not await pro.count():
+                    t0 = page.locator(PRO_TRIGGER).first
+                    if not await t0.count():
+                        await _escape(page)
+                        continue
+                    pro = t0
+                with contextlib.suppress(Exception):
+                    await pro.hover()
+                    await page.wait_for_timeout(350)
+                trig = page.locator(PRO_TRIGGER).first
+                if await trig.count():
+                    with contextlib.suppress(Exception):
+                        await trig.click(force=True)
+                        await page.wait_for_timeout(500)
+                # Click the requested sub INSIDE the freshly opened submenu (last menu),
+                # disambiguating it from the same-named top-level group item.
+                submenu = page.locator('[role="menu"]').last
+                subradio = submenu.get_by_role(
                     "menuitemradio", name=re.compile(re.escape(sub))).first
+                if not await subradio.count():
+                    subradio = page.get_by_role(
+                        "menuitemradio", name=re.compile(re.escape(sub))).last
                 if await subradio.count():
-                    if (await subradio.get_attribute("aria-checked")) != "true":
+                    with contextlib.suppress(Exception):
                         await subradio.click()
                         await page.wait_for_timeout(400)
-                    await _escape(page)
+                await _escape(page)
+                # VERIFY against the composer indicator — retry if it didn't take.
+                cur = await _current_effort_label(page)
+                if "rozšíř" in cur.lower() or cur.lower().startswith("pro"):
+                    log(f"effort verified -> {cur!r} (wanted {sub!r})")
                     return f"Pro · {sub}"
-            # fallback: select plain Pro (Standard) if submenu unavailable
-            if (await pro.get_attribute("aria-checked")) != "true":
-                await pro.click()
-                await page.wait_for_timeout(400)
-            await _escape(page)
-            return "Pro"
+                log(f"effort attempt {attempt+1} not yet Pro (indicator={cur!r}); retrying")
+            log(f"effort UNVERIFIED, indicator stuck at {cur!r}")
+            return f"pro-unverified:{cur or 'no-label'}"
 
         # ── plain levels ──
         label = EFFORT_MAP.get(effort)
