@@ -1,7 +1,11 @@
 """stdio MCP server exposing the ChatGPT-Pro gateway as tools.
 
 Thin client over the daemon's loopback HTTP API. Usable from Claude Code and codex.
-Tools: chatgpt_status, chatgpt_ask, chatgpt_poll, chatgpt_login.
+Tools: chatgpt_status, chatgpt_ask, chatgpt_poll, chatgpt_login, chatgpt_instances.
+
+Every tool takes an ``instance`` (named session) so several Pro conversations on
+separate Camoufox profiles/daemons can be driven in parallel; it defaults to the
+configured default instance.
 """
 
 from __future__ import annotations
@@ -16,39 +20,78 @@ from . import config
 mcp = FastMCP("chatgpt-pro")
 
 
-async def _get(path: str):
+class _Unknown(Exception):
+    """Requested instance is not registered / not running."""
+
+
+def _base(instance: str) -> str:
+    port = config.instance_port(instance)
+    if port is None:
+        raise _Unknown(
+            f"unknown instance '{instance}'. Known: {sorted(config.load_instances())}. "
+            f"Start it with:  cgw serve {instance}")
+    return config.daemon_url(port)
+
+
+async def _get(base: str, path: str):
     async with aiohttp.ClientSession() as s:
-        async with s.get(config.DAEMON_URL + path, timeout=aiohttp.ClientTimeout(total=30)) as r:
+        async with s.get(base + path, timeout=aiohttp.ClientTimeout(total=30)) as r:
             return await r.json(), r.status
 
 
-async def _post(path: str, data: dict):
+async def _post(base: str, path: str, data: dict):
     async with aiohttp.ClientSession() as s:
-        async with s.post(config.DAEMON_URL + path, json=data,
+        async with s.post(base + path, json=data,
                           timeout=aiohttp.ClientTimeout(total=30)) as r:
             return await r.json(), r.status
 
 
-_DOWN = (f"Gateway daemon is not running at {config.DAEMON_URL}.\n"
-         "Start it on the workstation with:  cd ~/chatgpt-gateway/camoufox-gateway "
-         "&& uv run cgw serve   (or via the systemd user service).")
+def _down(instance: str, base: str) -> str:
+    return (f"Gateway daemon for instance '{instance}' is not running at {base}.\n"
+            "Start it on the workstation with:  cd ~/chatgpt-gateway/camoufox-gateway "
+            f"&& uv run cgw serve {instance}   (or via the cgw-gateway@{instance} "
+            "systemd service).")
 
 
 @mcp.tool()
-async def chatgpt_status() -> str:
-    """Check whether the ChatGPT-Pro gateway is up and logged in. Call before asking."""
+async def chatgpt_instances() -> str:
+    """List the named ChatGPT-Pro instances (sessions) and whether each daemon is up."""
+    reg = config.load_instances()
+    if not reg:
+        return ("No instances registered. Start one on the workstation with:  "
+                "cgw serve <name>")
+    out = []
+    for name in sorted(reg):
+        rec = reg[name]
+        base = config.daemon_url(int(rec["port"])) if rec.get("port") else "?"
+        try:
+            h, _ = await _get(base, "/health")
+            state = f"up  logged_in={h.get('logged_in')}  busy={h.get('busy_count')}  queued={h.get('queued')}"
+        except Exception:
+            state = "down"
+        out.append(f"{name}  (account {rec.get('account')}, port {rec.get('port')}): {state}")
+    return "\n".join(out)
+
+
+@mcp.tool()
+async def chatgpt_status(instance: str = config.DEFAULT_INSTANCE) -> str:
+    """Check whether a ChatGPT-Pro instance is up and logged in. Call before asking."""
     try:
-        data, _ = await _get("/health")
+        base = _base(instance)
+    except _Unknown as e:
+        return str(e)
+    try:
+        data, _ = await _get(base, "/health")
     except Exception:
-        return _DOWN
+        return _down(instance, base)
     li = data.get("logged_in")
     lines = [
-        f"Gateway: running (account {data.get('account')})",
+        f"Gateway: running (instance {data.get('instance')}, account {data.get('account')})",
         f"Logged in: {li}",
         f"Busy: {data.get('busy')}  Queued: {data.get('queued')}",
     ]
     if not li:
-        lines.append("\nNot logged in. Run the chatgpt_login tool, or `cgw login --headed` "
+        lines.append(f"\nNot logged in. Run chatgpt_login, or `cgw login --headed {instance}` "
                      "on the workstation if a CAPTCHA appears.")
     return "\n".join(lines)
 
@@ -59,6 +102,8 @@ async def chatgpt_ask(
     effort: str = "pro",
     timeout: int = 1200,
     system: str | None = None,
+    instance: str = config.DEFAULT_INSTANCE,
+    cont: bool = False,
     ctx: Context | None = None,
 ) -> str:
     """Ask ChatGPT Pro and return its answer (markdown).
@@ -66,13 +111,21 @@ async def chatgpt_ask(
     Uses the logged-in browser session via a persistent Camoufox profile — no API key.
     effort: 'pro' (GPT-5.5 Pro deep reasoning, DEFAULT; can take minutes),
     'extended' (Very High thinking), 'high', 'standard', 'instant' (fast).
-    Each call starts a fresh conversation. Polls until complete; reports progress.
+    instance: which named session to ask — run separate Pro conversations in parallel
+    by pointing different calls at different instances (see chatgpt_instances).
+    cont=True continues that instance's current conversation instead of starting fresh.
+    Each call otherwise starts a new conversation. Polls until complete; reports progress.
     """
     try:
-        job, status = await _post("/ask", {"message": message, "effort": effort,
-                                           "timeout": timeout, "system": system})
+        base = _base(instance)
+    except _Unknown as e:
+        return str(e)
+    try:
+        job, status = await _post(base, "/ask", {"message": message, "effort": effort,
+                                                 "timeout": timeout, "system": system,
+                                                 "continue": cont})
     except Exception:
-        return _DOWN
+        return _down(instance, base)
     if status != 200:
         return f"Gateway error: {job.get('error', status)}"
     jid = job["job_id"]
@@ -83,7 +136,7 @@ async def chatgpt_ask(
     while loop.time() < deadline:
         await asyncio.sleep(2)
         try:
-            st, _ = await _get(f"/jobs/{jid}")
+            st, _ = await _get(base, f"/jobs/{jid}")
         except Exception:
             continue
         prog = st.get("progress")
@@ -101,12 +154,16 @@ async def chatgpt_ask(
 
 
 @mcp.tool()
-async def chatgpt_poll(job_id: str) -> str:
+async def chatgpt_poll(job_id: str, instance: str = config.DEFAULT_INSTANCE) -> str:
     """Poll a previously submitted job by id (status + partial/final text)."""
     try:
-        st, code = await _get(f"/jobs/{job_id}")
+        base = _base(instance)
+    except _Unknown as e:
+        return str(e)
+    try:
+        st, code = await _get(base, f"/jobs/{job_id}")
     except Exception:
-        return _DOWN
+        return _down(instance, base)
     if code == 404:
         return f"Unknown job {job_id}"
     if st.get("status") == "done":
@@ -115,16 +172,20 @@ async def chatgpt_poll(job_id: str) -> str:
 
 
 @mcp.tool()
-async def chatgpt_login() -> str:
-    """Trigger a headless auto-login of the gateway's ChatGPT profile."""
+async def chatgpt_login(instance: str = config.DEFAULT_INSTANCE) -> str:
+    """Trigger a headless auto-login of an instance's ChatGPT profile."""
     try:
-        data, code = await _post("/login", {})
+        base = _base(instance)
+    except _Unknown as e:
+        return str(e)
+    try:
+        data, code = await _post(base, "/login", {})
     except Exception:
-        return _DOWN
+        return _down(instance, base)
     if data.get("logged_in"):
         return "Logged in."
     return (f"Login not completed: {data.get('error', 'unknown')}. "
-            "If CAPTCHA, run `cgw login --headed` on the workstation.")
+            f"If CAPTCHA, run `cgw login --headed {instance}` on the workstation.")
 
 
 def run_mcp() -> None:

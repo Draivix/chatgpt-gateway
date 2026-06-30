@@ -27,7 +27,8 @@ def log(msg: str) -> None:
 
 
 class Gateway:
-    def __init__(self, account: str, headed: bool, with_addon: bool):
+    def __init__(self, instance: str, account: str, headed: bool, with_addon: bool):
+        self.instance = instance
         self.account = account
         self.headed = headed
         self.with_addon = with_addon
@@ -133,6 +134,7 @@ async def _h_health(request: web.Request) -> web.Response:
     busy = [j for j in gw.busy.values() if j]
     return web.json_response({
         "ok": True,
+        "instance": gw.instance,
         "account": gw.account,
         "logged_in": await is_logged_in(gw.page),
         "workers": len(gw.pages),
@@ -182,14 +184,15 @@ async def _h_login(request: web.Request) -> web.Response:
     return web.json_response({"logged_in": ok})
 
 
-async def _serve(account: str, headed: bool, with_addon: bool):
+async def _serve(instance: str, account: str, port: int, headed: bool, with_addon: bool):
     from camoufox.async_api import AsyncCamoufox
 
-    gw = Gateway(account, headed, with_addon)
-    clear_stale_lock(account)
-    kw = camoufox_kwargs(account, headless=not headed, with_addon=with_addon)
+    gw = Gateway(instance, account, headed, with_addon)
+    clear_stale_lock(instance)
+    kw = camoufox_kwargs(instance, headless=not headed, with_addon=with_addon)
     n = config.WORKERS
-    log(f"launching Camoufox account={account} headless={not headed} addon={with_addon} workers={n}")
+    log(f"launching Camoufox instance={instance} account={account} port={port} "
+        f"headless={not headed} addon={with_addon} workers={n}")
     async with AsyncCamoufox(**kw) as ctx:
         # Open N pages sharing the one logged-in session (Firefox: each is a window).
         gw.pages = [await first_page(ctx)]
@@ -223,9 +226,9 @@ async def _serve(account: str, headed: bool, with_addon: bool):
         ])
         runner = web.AppRunner(app)
         await runner.setup()
-        site = web.TCPSite(runner, config.DAEMON_HOST, config.DAEMON_PORT)
+        site = web.TCPSite(runner, config.DAEMON_HOST, port)
         await site.start()
-        log(f"HTTP API on {config.DAEMON_URL}")
+        log(f"HTTP API on {config.daemon_url(port)}")
         try:
             await asyncio.Event().wait()  # run until killed
         finally:
@@ -234,9 +237,10 @@ async def _serve(account: str, headed: bool, with_addon: bool):
             await runner.cleanup()
 
 
-def run_daemon(account: str, *, headed: bool, with_addon: bool) -> int:
+def run_daemon(instance: str, account: str, port: int, *,
+               headed: bool, with_addon: bool) -> int:
     try:
-        asyncio.run(_serve(account, headed, with_addon))
+        asyncio.run(_serve(instance, account, port, headed, with_addon))
     except KeyboardInterrupt:
         pass
     return 0

@@ -1,5 +1,10 @@
 # persistent browser profiles hold live ChatGPT session cookies — NEVER commit
 profile/
+# credentials & machine-local state — NEVER commit (real ones live in ~/.config/cgw)
+accounts.json
+instances.json
+*.env
+cgw.env
 # debug artifacts (screenshots/html dumps from login flow)
 debug/
 # generated Firefox addon (rebuilt from the extension at launch)

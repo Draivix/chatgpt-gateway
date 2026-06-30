@@ -7,9 +7,14 @@ Wants=network-online.target
 Type=simple
 # %h = your home dir. Adjust if you cloned elsewhere or installed uv to another path.
 WorkingDirectory=%h/chatgpt-gateway/camoufox-gateway
-# Put your real CGW_ACCOUNT / CGW_ACCOUNTS_FILE here (optional; '-' = ignore if missing):
-EnvironmentFile=-%h/.config/cgw/cgw.env
+# Inline defaults FIRST; cgw.env (optional; '-' = ignore if missing) is read LAST so it
+# overrides them — systemd applies Environment*= directives in file order.
 Environment=CGW_ACCOUNT=default
+# Headed vs headless is config-driven (CGW_HEADED, default false = headless background
+# daemon). Set CGW_HEADED=true in cgw.env to make the daemon show a window;
+# `cgw serve --headed/--headless` overrides per-invocation.
+Environment=CGW_HEADED=false
+EnvironmentFile=-%h/.config/cgw/cgw.env
 # Headless Camoufox (Firefox -headless) needs no X server. If your build insists on
 # a display, prefix ExecStart with:  /usr/bin/xvfb-run -a
 ExecStart=%h/.local/bin/uv run --project %h/chatgpt-gateway/camoufox-gateway cgw serve

@@ -1,0 +1,32 @@
+[Unit]
+# Templated, multi-instance gateway: one daemon per named session.
+#   systemctl --user enable --now cgw-gateway@work   ->  runs `cgw serve work`
+#   systemctl --user enable --now cgw-gateway@research
+# Each instance gets its own Camoufox profile (profile/<name>) and its own port,
+# allocated/recorded in the instance registry (~/.config/cgw/instances.json).
+Description=Camoufox ChatGPT-Pro gateway — instance %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# %h = your home dir. Adjust if you cloned elsewhere or installed uv to another path.
+WorkingDirectory=%h/chatgpt-gateway/camoufox-gateway
+# %i = the instance name (the part after @). It also picks the creds account when an
+# accounts.json key of the same name exists, else the default account; override per
+# instance in the optional cgw-<instance>.env file below (e.g. CGW_ACCOUNT=second).
+Environment=CGW_INSTANCE=%i
+Environment=CGW_HEADED=false
+# Shared defaults first, then a per-instance override file (both optional; '-' = skip).
+EnvironmentFile=-%h/.config/cgw/cgw.env
+EnvironmentFile=-%h/.config/cgw/cgw-%i.env
+# Headless Camoufox (Firefox -headless) needs no X server. If your build insists on
+# a display, prefix ExecStart with:  /usr/bin/xvfb-run -a
+ExecStart=%h/.local/bin/uv run --project %h/chatgpt-gateway/camoufox-gateway cgw serve %i
+Restart=always
+RestartSec=5
+# give a long stop timeout so an in-flight extended-thinking answer can finish
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target

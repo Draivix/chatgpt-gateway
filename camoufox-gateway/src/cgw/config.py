@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,17 @@ ACCOUNTS_FILE = Path(
 # Which account key (from accounts.json) to use by default. Override with CGW_ACCOUNT.
 DEFAULT_ACCOUNT = os.environ.get("CGW_ACCOUNT", "default")
 
+# An INSTANCE is one named browser session = one Camoufox profile + one daemon + one
+# port. The instance name (not the account) keys the profile dir, so several named
+# sessions can run on the same account (each its own login). Default instance name
+# follows CGW_ACCOUNT so the legacy single-daemon setup keeps working unchanged.
+DEFAULT_INSTANCE = os.environ.get("CGW_INSTANCE", DEFAULT_ACCOUNT)
+
+# Where the instance registry (name -> {port, account}) lives.
+STATE_DIR = Path(os.environ.get("CGW_STATE_DIR", str(Path.home() / ".config" / "cgw")))
+INSTANCES_FILE = Path(
+    os.environ.get("CGW_INSTANCES_FILE", str(STATE_DIR / "instances.json")))
+
 
 def _envbool(name: str, default: bool = False) -> bool:
     v = os.environ.get(name)
@@ -45,10 +57,18 @@ def _envbool(name: str, default: bool = False) -> bool:
 # on the CLI override this per-invocation.
 HEADED = _envbool("CGW_HEADED", False)
 
-# Loopback HTTP API the MCP server talks to.
+# Loopback HTTP API. Each named INSTANCE (session) runs its own daemon bound to its
+# own port: the first instance uses this base port, the rest get base+1, base+2, …
+# allocated in the instance registry (see below). CGW_PORT pins a specific port
+# (single-instance / back-compat); when set it overrides registry allocation.
 DAEMON_HOST = os.environ.get("CGW_HOST", "127.0.0.1")
-DAEMON_PORT = int(os.environ.get("CGW_PORT", "18791"))
-DAEMON_URL = f"http://{DAEMON_HOST}:{DAEMON_PORT}"
+DAEMON_PORT = int(os.environ.get("CGW_PORT", "18791"))     # base port (= default instance)
+_PORT_FORCED = "CGW_PORT" in os.environ
+DAEMON_URL = f"http://{DAEMON_HOST}:{DAEMON_PORT}"          # back-compat (default instance)
+
+
+def daemon_url(port: int) -> str:
+    return f"http://{DAEMON_HOST}:{port}"
 
 CHATGPT_URL = "https://chatgpt.com/"
 
@@ -69,8 +89,8 @@ NAV_TIMEOUT_MS = int(os.environ.get("CGW_NAV_TIMEOUT_MS", "60000"))
 ACTION_TIMEOUT_MS = int(os.environ.get("CGW_ACTION_TIMEOUT_MS", "45000"))
 
 
-def profile_dir(account: str) -> Path:
-    p = PROFILE_BASE / account
+def profile_dir(instance: str) -> Path:
+    p = PROFILE_BASE / instance
     p.mkdir(parents=True, exist_ok=True)
     try:
         PROFILE_BASE.chmod(0o700)
@@ -106,3 +126,77 @@ def list_accounts() -> list[str]:
             return sorted(json.load(f).get("accounts", {}))
     except OSError:
         return []
+
+
+def resolve_account(instance: str, explicit: str | None = None) -> str:
+    """Account creds an instance uses: explicit flag > a same-named account > default.
+
+    So ``cgw serve work`` (no matching account) runs the *default* account under a
+    separate ``work`` profile, while ``cgw serve second`` still uses the ``second``
+    account if one exists — preserving the pre-instance behaviour.
+    """
+    if explicit:
+        return explicit
+    if instance in set(list_accounts()):
+        return instance
+    return DEFAULT_ACCOUNT
+
+
+# ── Instance registry (name -> {port, account}) ──────────────────────────────
+
+def load_instances() -> dict:
+    try:
+        with INSTANCES_FILE.open() as f:
+            return json.load(f).get("instances", {})
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_instances(instances: dict) -> None:
+    INSTANCES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = INSTANCES_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"instances": instances}, indent=2))
+    tmp.replace(INSTANCES_FILE)
+
+
+def allocate_port(instance: str, account: str, explicit: int | None = None) -> int:
+    """Reserve (and persist) the port for an instance, under a cross-process lock.
+
+    Reuses the instance's recorded port if it has one; otherwise grabs the lowest
+    free port from the base. ``explicit`` (``--port`` / ``CGW_PORT``) always wins.
+    """
+    INSTANCES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock = INSTANCES_FILE.with_suffix(".lock")
+    with lock.open("w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            instances = load_instances()
+            rec = instances.get(instance, {})
+            if explicit is not None:
+                port = explicit
+            elif rec.get("port"):
+                port = int(rec["port"])
+            else:
+                used = {int(r["port"]) for r in instances.values() if r.get("port")}
+                port = DAEMON_PORT
+                while port in used:
+                    port += 1
+            instances[instance] = {"port": port, "account": account}
+            _save_instances(instances)
+            return port
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def instance_port(instance: str) -> int | None:
+    """Resolve an instance's port for a CLIENT (read-only; no allocation).
+
+    Falls back to the base port for the default instance so ``cgw ask`` works
+    before anything has been registered (legacy single-daemon layout).
+    """
+    rec = load_instances().get(instance)
+    if rec and rec.get("port"):
+        return int(rec["port"])
+    if instance == DEFAULT_INSTANCE:
+        return DAEMON_PORT
+    return None

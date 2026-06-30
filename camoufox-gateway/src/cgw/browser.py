@@ -11,12 +11,12 @@ from pathlib import Path
 from .config import EXTENSION_DIR, SUBPROJECT_DIR, profile_dir
 
 
-def clear_stale_lock(account: str) -> None:
+def clear_stale_lock(instance: str) -> None:
     """Remove a Firefox profile lock left by a crashed/killed browser.
 
     Only removes it when the owning PID is dead, so a live daemon is never disturbed.
     """
-    d = profile_dir(account)
+    d = profile_dir(instance)
     lock = d / "lock"
     try:
         target = os.readlink(lock)
@@ -63,11 +63,11 @@ def build_addon() -> Path | None:
         return None
 
 
-def camoufox_kwargs(account: str, *, headless: bool, with_addon: bool = True) -> dict:
+def camoufox_kwargs(instance: str, *, headless: bool, with_addon: bool = True) -> dict:
     """Build kwargs for ``AsyncCamoufox(**kwargs)`` for a persistent profile."""
     kwargs: dict = {
         "persistent_context": True,
-        "user_data_dir": str(profile_dir(account)),
+        "user_data_dir": str(profile_dir(instance)),
         "headless": headless,
         "humanize": True,
         "locale": ["cs-CZ", "en-US"],

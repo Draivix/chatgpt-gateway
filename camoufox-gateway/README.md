@@ -23,14 +23,15 @@ client never has to hold a multi-minute HTTP request.
 4. [Credentials: `accounts.json`](#credentials-accountsjson)
 5. [First login](#first-login)
 6. [Run the daemon](#run-the-daemon)
-7. [CLI reference](#cli-reference)
-8. [Reasoning effort levels](#reasoning-effort-levels)
-9. [Use from Claude Code (skill + MCP)](#use-from-claude-code-skill--mcp)
-10. [Use from codex](#use-from-codex)
-11. [Run as a systemd service](#run-as-a-systemd-service)
-12. [How it works](#how-it-works)
-13. [Troubleshooting](#troubleshooting)
-14. [Security](#security)
+7. [Multiple instances (named sessions)](#multiple-instances-named-sessions--parallel-pro-conversations)
+8. [CLI reference](#cli-reference)
+9. [Reasoning effort levels](#reasoning-effort-levels)
+10. [Use from Claude Code (skill + MCP)](#use-from-claude-code-skill--mcp)
+11. [Use from codex](#use-from-codex)
+12. [Run as a systemd service](#run-as-a-systemd-service)
+13. [How it works](#how-it-works)
+14. [Troubleshooting](#troubleshooting)
+15. [Security](#security)
 
 ---
 
@@ -156,13 +157,53 @@ If OpenAI shows a CAPTCHA (rare, usually only from a brand-new IP), run once wit
 ## Run the daemon
 
 ```bash
-uv run cgw serve <account>            # headless (default)
-uv run cgw serve <account> --headed   # visible browser window
+uv run cgw serve <account>            # headless or headed per CGW_HEADED (default headless)
+uv run cgw serve <account> --headed   # force a visible browser window
+uv run cgw serve <account> --headless # force no window (override CGW_HEADED=true)
 uv run cgw serve <account> --no-addon # don't load the extension addon
 ```
 
+Headed vs headless is **config-driven** via `CGW_HEADED` (`true`/`1`/`yes`/`on` →
+headed; default `false` → headless). Set it in `~/.config/cgw/cgw.env` (read by the
+systemd unit) or the environment. `--headed` / `--headless` override it per call. Applies
+to `serve`, `login`, and `probe`.
+
 The daemon owns the browser for its whole lifetime, auto-logs-in on startup if needed,
 and listens on `http://127.0.0.1:18791` (override with `CGW_HOST` / `CGW_PORT`).
+
+---
+
+## Multiple instances (named sessions) — parallel Pro conversations
+
+An **instance** is one named browser session: its own Camoufox profile (`profile/<name>`),
+its own login, its own daemon, its own port. Run several at once to hold **independent
+Pro conversations in parallel** instead of queueing behind one minutes-long answer.
+
+```bash
+uv run cgw login work               # log the "work" profile in (own browser/login)
+uv run cgw login research
+uv run cgw serve work               # daemon for "work"  -> auto-port 18791
+uv run cgw serve research           # daemon for "research" -> auto-port 18792
+uv run cgw instances                # list sessions + live health
+uv run cgw ask "..." --instance work
+uv run cgw ask "..." --instance research --continue   # keep that session's thread
+```
+
+- **Instance name vs account.** The name keys the *profile*; creds come from the
+  `--account` flag, else a same-named `accounts.json` key, else the default account. So
+  `cgw serve work` runs the **default** account under a separate `work` profile — two
+  named sessions on one ChatGPT account, each its own login. Point instances at different
+  `accounts.json` keys (`--account second`) for full account isolation.
+- **Ports** are allocated once per instance (base `18791`, then `+1`, …) and recorded in
+  the registry at `~/.config/cgw/instances.json`; reused on restart. `--port N` / `CGW_PORT`
+  pin one explicitly.
+- **Same account, N sessions** = N concurrent logins on one ChatGPT plan → watch for
+  OpenAI rate-limiting. Separate accounts per instance avoids it.
+- **Back-compat:** with no instance name everything targets the default instance on the
+  base port exactly as before.
+
+systemd (one supervised daemon per instance) via the template unit — see *Run as a
+service* below.
 
 ---
 
@@ -170,16 +211,20 @@ and listens on `http://127.0.0.1:18791` (override with `CGW_HOST` / `CGW_PORT`).
 
 | Command | What it does |
 |---|---|
-| `cgw login [account] [--headed] [--debug] [--no-addon] [--hold N]` | Log a persistent profile into chatgpt.com. `--hold N` = seconds to keep a headed window open for a manual finish. |
-| `cgw serve [account] [--headed] [--no-addon]` | Run the gateway daemon. |
-| `cgw ask "<message>" [--effort LEVEL] [--timeout SECONDS]` | One-shot ask via the running daemon. Prints the answer to stdout, progress to stderr. |
-| `cgw status` | Daemon health (JSON: account, logged_in, busy, queued). |
+| `cgw login [instance] [--account KEY] [--headed\|--headless] [--debug] [--no-addon] [--hold N]` | Log a persistent profile (named session) into chatgpt.com. `--hold N` = seconds to keep a headed window open for a manual finish. |
+| `cgw serve [instance] [--account KEY] [--port N] [--headed\|--headless] [--no-addon]` | Run the gateway daemon for one named instance. |
+| `cgw ask "<message>" [--instance NAME] [--effort LEVEL] [--timeout SECONDS] [--continue]` | One-shot ask via the running daemon. Prints the answer to stdout, progress to stderr. `--continue` keeps the instance's current conversation. |
+| `cgw status [--instance NAME]` | Daemon health (JSON: instance, account, logged_in, busy, queued). |
+| `cgw instances` | List named instances (sessions) from the registry + each daemon's live state. |
 | `cgw accounts` | List account keys from your `accounts.json`. |
 | `cgw mcp` | Run the stdio MCP server (used by Claude Code / codex; not for humans). |
-| `cgw probe [account]` | Dev tool: re-capture the live ChatGPT DOM/network if OpenAI changes the UI. Writes to `debug/`. |
+| `cgw probe [instance] [--account KEY]` | Dev tool: re-capture the live ChatGPT DOM/network if OpenAI changes the UI. Writes to `debug/`. |
 
-Environment variables: `CGW_ACCOUNT`, `CGW_ACCOUNTS_FILE`, `CGW_HOST`, `CGW_PORT`,
-`CGW_ASK_TIMEOUT`.
+The `[instance]` positional defaults to `CGW_INSTANCE` (itself defaulting to `CGW_ACCOUNT`),
+so omitting it everywhere reproduces the original single-daemon behaviour.
+
+Environment variables: `CGW_ACCOUNT`, `CGW_ACCOUNTS_FILE`, `CGW_INSTANCE`, `CGW_STATE_DIR`,
+`CGW_INSTANCES_FILE`, `CGW_HEADED`, `CGW_HOST`, `CGW_PORT`, `CGW_ASK_TIMEOUT`.
 
 Examples:
 
@@ -187,7 +232,8 @@ Examples:
 uv run cgw ask "Refactor this regex and explain why: ^(?=.*\d).{8,}$"
 uv run cgw ask "Quick: capital of Japan?" --effort instant
 uv run cgw ask "Prove the halting problem is undecidable." --effort pro --timeout 900
-CGW_ACCOUNT=second uv run cgw serve     # run the daemon on a different account
+uv run cgw ask "Continue that proof." --instance research --continue
+CGW_ACCOUNT=second uv run cgw serve     # default instance on a different account
 ```
 
 ---
@@ -288,6 +334,29 @@ loginctl enable-linger "$USER"
 The unit uses `%h` (your home) and an optional `EnvironmentFile`, so it works unmodified
 if you cloned to `~/chatgpt-gateway` and installed uv to `~/.local/bin`. Adjust
 `WorkingDirectory`/`ExecStart` otherwise.
+
+### One service per instance (template unit)
+
+For multiple named sessions, use the template unit `cgw-gateway@.service` — the part after
+`@` is the instance name (`%i`). Log each profile in once, then enable a service per
+instance:
+
+```bash
+cp systemd/cgw-gateway@.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+
+uv run cgw login work && uv run cgw login research   # once per profile
+systemctl --user enable --now cgw-gateway@work
+systemctl --user enable --now cgw-gateway@research
+uv run cgw instances                                 # verify both are up
+
+# per-instance overrides (e.g. a different account) go in cgw-<instance>.env:
+echo 'CGW_ACCOUNT=second' > ~/.config/cgw/cgw-research.env
+```
+
+Each instance gets its own profile and an auto-allocated port (registry:
+`~/.config/cgw/instances.json`). The singleton `cgw-gateway.service` and the template can
+coexist — the singleton serves the default instance.
 
 ---
 

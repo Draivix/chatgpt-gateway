@@ -16,12 +16,12 @@ from .config import CHATGPT_URL, DEBUG_DIR
 from .login import ensure_logged_in, is_logged_in
 
 
-async def run_probe(account: str, headed: bool) -> int:
+async def run_probe(instance: str, account: str, headed: bool) -> int:
     from camoufox.async_api import AsyncCamoufox
 
     DEBUG_DIR.mkdir(parents=True, exist_ok=True)
     acct = config.load_account(account)
-    kw = camoufox_kwargs(account, headless=not headed)
+    kw = camoufox_kwargs(instance, headless=not headed)
     async with AsyncCamoufox(**kw) as ctx:
         page = await first_page(ctx)
 
