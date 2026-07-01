@@ -80,6 +80,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--timeout", type=int, default=config.ASK_TIMEOUT_S)
     p.add_argument("--continue", dest="cont", action="store_true",
                    help="continue the current conversation instead of starting a new chat")
+    p.add_argument("--file", dest="files", action="append", metavar="PATH",
+                   help="attach a local file to the message (repeatable). Paths are on "
+                        "the gateway host.")
 
     p = sub.add_parser("status", help="check the running daemon")
     p.add_argument("--instance", default=config.DEFAULT_INSTANCE,
@@ -117,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "ask":
         from .client import cli_ask
         return cli_ask(args.message, args.effort, args.timeout, cont=args.cont,
-                       instance=args.instance)
+                       instance=args.instance, files=args.files)
     if args.cmd == "status":
         from .client import cli_status
         return cli_status(args.instance)

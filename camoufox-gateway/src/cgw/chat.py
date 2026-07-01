@@ -15,6 +15,7 @@ import asyncio
 import contextlib
 import re
 import time
+from pathlib import Path
 
 from .login import is_logged_in
 
@@ -48,6 +49,11 @@ SEL = {
     "assistant_md": '[data-message-author-role="assistant"] .markdown',
     "done_marker": '[data-testid="copy-turn-action-button"]',
     "new_chat": ('[data-testid="create-new-chat-button"], a[href="/"]'),
+    # File attachments: the composer "+" button mounts a general (any-type) file input
+    # (#upload-files, accept=""); after upload each file renders as a "file tile" chip.
+    "attach_plus": '[data-testid="composer-plus-btn"]',
+    "file_input": "#upload-files",
+    "file_tile": 'form div[class*="file-tile"]',
 }
 
 
@@ -320,9 +326,71 @@ async def _wait_complete(page, timeout_s: int, progress, prior_count: int = 0) -
         await asyncio.sleep(0.7)
 
 
+async def _send_disabled(page) -> bool | None:
+    """True if the send button is disabled, False if enabled, None if absent."""
+    return await page.evaluate(
+        r"""() => { const b = document.querySelector(
+              '[data-testid=send-button], #composer-submit-button');
+            return b ? b.disabled : null; }""")
+
+
+async def _composer_uploading(page) -> bool:
+    """True while an upload spinner/progressbar is live inside the composer form."""
+    try:
+        return bool(await page.evaluate(
+            r"""() => { const f = document.querySelector('#prompt-textarea')?.closest('form');
+                  if (!f) return false;
+                  return f.querySelectorAll('.animate-spin, [role=progressbar]').length > 0; }"""))
+    except Exception:
+        return False
+
+
+async def _attach_files(page, files: list[str], progress=None) -> int:
+    """Attach local files to the composer, one per '+' menu open, and wait for each
+    upload to finish. Returns the number of file-tile chips present at the end.
+
+    ChatGPT mounts a general (any-type) ``#upload-files`` input only while the
+    composer "+" menu is open, so we reopen it per file. Upload completion is judged
+    by the send button re-enabling (disabled -> enabled) with no spinner left.
+    """
+    paths = []
+    for f in files:
+        p = Path(f).expanduser()
+        if not p.is_file():
+            raise FileNotFoundError(f"attachment not found on gateway host: {p}")
+        paths.append(str(p.resolve()))
+
+    for i, path in enumerate(paths):
+        if progress:
+            progress(f"attaching {Path(path).name} ({i + 1}/{len(paths)})")
+        # Open the "+" menu (mounts #upload-files). Tooltip overlays the button, so force.
+        with contextlib.suppress(Exception):
+            await page.locator(SEL["attach_plus"]).first.click(force=True)
+            await page.wait_for_timeout(500)
+        inp = page.locator(SEL["file_input"]).first
+        if not await inp.count():
+            # fallback: last file input on the page (menu variant / DOM change)
+            inp = page.locator('input[type=file]').last
+        await inp.set_input_files(path)
+        # Wait: this file's tile present, spinner gone, send re-enabled.
+        want = i + 1
+        deadline = time.time() + 90
+        while time.time() < deadline:
+            await page.wait_for_timeout(600)
+            if await _count(page, SEL["file_tile"]) >= want \
+                    and not await _composer_uploading(page) \
+                    and await _send_disabled(page) is False:
+                break
+    tiles = await _count(page, SEL["file_tile"])
+    if progress:
+        progress(f"attached {tiles} file(s)")
+    return tiles
+
+
 async def ask(page, prompt: str, *, effort: str = "pro",
               system: str | None = None, timeout_s: int = 1200,
-              progress=None, cont: bool = False) -> dict:
+              progress=None, cont: bool = False,
+              files: list[str] | None = None) -> dict:
     """Send a prompt and return {ok, text, model/effort, elapsed}. Serialized by daemon.
 
     ``cont=True`` continues the CURRENT conversation (does not start a new chat),
@@ -357,6 +425,9 @@ async def ask(page, prompt: str, *, effort: str = "pro",
             await new_chat(page)
             label = await set_effort(page, effort)
             _p(f"effort: {label}")
+
+        if files:
+            await _attach_files(page, files, progress=_p)
 
         prior_count = await _count(page, SEL["assistant_md"])
         msg = f"{system}\n\n{prompt}" if system else prompt

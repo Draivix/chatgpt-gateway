@@ -99,7 +99,7 @@ class Gateway:
                     chat.ask(
                         page, job["message"], effort=job["effort"],
                         system=job.get("system"), timeout_s=job["timeout"], progress=prog,
-                        cont=job.get("cont", False),
+                        cont=job.get("cont", False), files=job.get("files"),
                     ),
                     timeout=job["timeout"] + 90,
                 )
@@ -153,6 +153,9 @@ async def _h_ask(request: web.Request) -> web.Response:
         return web.json_response({"error": "message required"}, status=400)
     jid = uuid.uuid4().hex[:12]
     cont = bool(data.get("continue"))
+    files = data.get("files") or None
+    if files is not None and not isinstance(files, list):
+        return web.json_response({"error": "files must be a list of paths"}, status=400)
     gw.jobs[jid] = {
         "status": "queued", "progress": "queued",
         "message": msg,
@@ -160,6 +163,7 @@ async def _h_ask(request: web.Request) -> web.Response:
         "system": data.get("system"),
         "timeout": int(data.get("timeout") or config.ASK_TIMEOUT_S),
         "cont": cont,
+        "files": files,
     }
     await (gw.cont_queue if cont else gw.queue).put(jid)
     return web.json_response(

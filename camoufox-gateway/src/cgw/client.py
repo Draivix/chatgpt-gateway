@@ -47,11 +47,11 @@ def cli_status(instance: str = config.DEFAULT_INSTANCE) -> int:
 
 
 def cli_ask(message: str, effort: str, timeout: int, cont: bool = False,
-            instance: str = config.DEFAULT_INSTANCE) -> int:
+            instance: str = config.DEFAULT_INSTANCE, files: list[str] | None = None) -> int:
     base = _resolve(instance)
     try:
         job = _post(base, "/ask", {"message": message, "effort": effort, "timeout": timeout,
-                                   "continue": cont})
+                                   "continue": cont, "files": files})
     except Exception as e:  # noqa: BLE001
         print(f"daemon not reachable at {base}: {e}\nStart it: cgw serve {instance}")
         return 1

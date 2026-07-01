@@ -213,7 +213,7 @@ service* below.
 |---|---|
 | `cgw login [instance] [--account KEY] [--headed\|--headless] [--debug] [--no-addon] [--hold N]` | Log a persistent profile (named session) into chatgpt.com. `--hold N` = seconds to keep a headed window open for a manual finish. |
 | `cgw serve [instance] [--account KEY] [--port N] [--headed\|--headless] [--no-addon]` | Run the gateway daemon for one named instance. |
-| `cgw ask "<message>" [--instance NAME] [--effort LEVEL] [--timeout SECONDS] [--continue]` | One-shot ask via the running daemon. Prints the answer to stdout, progress to stderr. `--continue` keeps the instance's current conversation. |
+| `cgw ask "<message>" [--instance NAME] [--effort LEVEL] [--timeout SECONDS] [--continue] [--file PATH …]` | One-shot ask via the running daemon. Prints the answer to stdout, progress to stderr. `--continue` keeps the instance's current conversation. `--file` attaches a local file (repeatable); paths are on the gateway host. |
 | `cgw status [--instance NAME]` | Daemon health (JSON: instance, account, logged_in, busy, queued). |
 | `cgw instances` | List named instances (sessions) from the registry + each daemon's live state. |
 | `cgw accounts` | List account keys from your `accounts.json`. |
@@ -233,8 +233,14 @@ uv run cgw ask "Refactor this regex and explain why: ^(?=.*\d).{8,}$"
 uv run cgw ask "Quick: capital of Japan?" --effort instant
 uv run cgw ask "Prove the halting problem is undecidable." --effort pro --timeout 900
 uv run cgw ask "Continue that proof." --instance research --continue
+uv run cgw ask "Review this file for bugs." --file src/auth.php --file src/db.php
 CGW_ACCOUNT=second uv run cgw serve     # default instance on a different account
 ```
+
+**Attaching files.** `--file PATH` (repeatable) uploads local files into the message via
+the composer's "＋" menu, so ChatGPT reads their contents — code, logs, data, etc. Paths
+resolve on the **gateway host** (where the daemon runs). From the MCP `chatgpt_ask` tool,
+pass `files: ["/abs/path.py", …]`.
 
 ---
 

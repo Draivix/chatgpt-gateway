@@ -104,6 +104,7 @@ async def chatgpt_ask(
     system: str | None = None,
     instance: str = config.DEFAULT_INSTANCE,
     cont: bool = False,
+    files: list[str] | None = None,
     ctx: Context | None = None,
 ) -> str:
     """Ask ChatGPT Pro and return its answer (markdown).
@@ -114,7 +115,9 @@ async def chatgpt_ask(
     instance: which named session to ask — run separate Pro conversations in parallel
     by pointing different calls at different instances (see chatgpt_instances).
     cont=True continues that instance's current conversation instead of starting fresh.
-    Each call otherwise starts a new conversation. Polls until complete; reports progress.
+    files: local file paths (on the gateway host) to attach to the message — e.g. code
+    files for ChatGPT to read/review. Each call otherwise starts a new conversation.
+    Polls until complete; reports progress.
     """
     try:
         base = _base(instance)
@@ -123,7 +126,7 @@ async def chatgpt_ask(
     try:
         job, status = await _post(base, "/ask", {"message": message, "effort": effort,
                                                  "timeout": timeout, "system": system,
-                                                 "continue": cont})
+                                                 "continue": cont, "files": files})
     except Exception:
         return _down(instance, base)
     if status != 200:
