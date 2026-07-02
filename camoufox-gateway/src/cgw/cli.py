@@ -71,7 +71,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--no-addon", action="store_true")
 
     p = sub.add_parser("ask", help="one-shot ask via the running daemon")
-    p.add_argument("message")
+    p.add_argument("message", nargs="?", default="",
+                   help="the prompt. Optional only with --chat (fetch that chat's "
+                        "latest answer without sending anything).")
     p.add_argument("--instance", default=config.DEFAULT_INSTANCE,
                    help="which named instance to ask (default from CGW_INSTANCE)")
     p.add_argument("--effort", default="pro",
@@ -80,9 +82,17 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--timeout", type=int, default=config.ASK_TIMEOUT_S)
     p.add_argument("--continue", dest="cont", action="store_true",
                    help="continue the current conversation instead of starting a new chat")
+    p.add_argument("--chat", dest="chat", default=None, metavar="URL_OR_ID",
+                   help="RESUME a specific past conversation by URL or id (see 'cgw "
+                        "chats'). With no message, just fetch its latest answer.")
     p.add_argument("--file", dest="files", action="append", metavar="PATH",
                    help="attach a local file to the message (repeatable). Paths are on "
                         "the gateway host.")
+
+    p = sub.add_parser("chats", help="list recorded conversations you can resume")
+    p.add_argument("--instance", default=config.DEFAULT_INSTANCE,
+                   help="which named instance to query (default from CGW_INSTANCE)")
+    p.add_argument("--limit", type=int, default=30, help="max rows to show")
 
     p = sub.add_parser("status", help="check the running daemon")
     p.add_argument("--instance", default=config.DEFAULT_INSTANCE,
@@ -119,8 +129,13 @@ def main(argv: list[str] | None = None) -> int:
                           headed=args.headed, with_addon=not args.no_addon)
     if args.cmd == "ask":
         from .client import cli_ask
+        if not args.message and not args.chat:
+            ap.error("message is required unless --chat is given")
         return cli_ask(args.message, args.effort, args.timeout, cont=args.cont,
-                       instance=args.instance, files=args.files)
+                       instance=args.instance, files=args.files, chat=args.chat)
+    if args.cmd == "chats":
+        from .client import cli_chats
+        return cli_chats(args.instance, args.limit)
     if args.cmd == "status":
         from .client import cli_status
         return cli_status(args.instance)

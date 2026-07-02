@@ -47,14 +47,18 @@ def cli_status(instance: str = config.DEFAULT_INSTANCE) -> int:
 
 
 def cli_ask(message: str, effort: str, timeout: int, cont: bool = False,
-            instance: str = config.DEFAULT_INSTANCE, files: list[str] | None = None) -> int:
+            instance: str = config.DEFAULT_INSTANCE, files: list[str] | None = None,
+            chat: str | None = None) -> int:
     base = _resolve(instance)
     try:
         job = _post(base, "/ask", {"message": message, "effort": effort, "timeout": timeout,
-                                   "continue": cont, "files": files})
+                                   "continue": cont, "files": files, "chat": chat})
     except Exception as e:  # noqa: BLE001
         print(f"daemon not reachable at {base}: {e}\nStart it: cgw serve {instance}")
         return 1
+    if "error" in job and "job_id" not in job:
+        print(f"ERROR: {job['error']}", file=sys.stderr)
+        return 2
     jid = job["job_id"]
     deadline = time.time() + timeout + 60
     last = None
@@ -71,11 +75,36 @@ def cli_ask(message: str, effort: str, timeout: int, cont: bool = False,
             print(f"… {last}", file=sys.stderr, flush=True)
         if st.get("status") in ("done", "error"):
             break
+    # Surface where this conversation lives so it can be resumed later.
+    if st.get("conversation_url"):
+        title = st.get("conversation_title") or ""
+        print(f"… conversation: {st['conversation_url']}"
+              f"{f'  ({title})' if title else ''}", file=sys.stderr, flush=True)
     if st.get("status") == "done":
         print(st.get("text", ""))
         return 0
     print(f"ERROR: {st.get('error', 'timeout')}", file=sys.stderr)
     return 2
+
+
+def cli_chats(instance: str = config.DEFAULT_INSTANCE, limit: int = 30) -> int:
+    """List recorded conversations so a user/agent can pick one to resume."""
+    base = _resolve(instance)
+    try:
+        data = _get(base, "/conversations")
+    except Exception:  # noqa: BLE001 — fall back to the on-disk store if daemon is down
+        data = {"conversations": sorted(
+            config.load_conversations().values(),
+            key=lambda r: r.get("last_used_at", 0), reverse=True)}
+    convs = data.get("conversations", [])[:limit]
+    if not convs:
+        print("no conversations recorded yet.")
+        return 0
+    for r in convs:
+        title = (r.get("title") or "(untitled)")[:48]
+        print(f"{r.get('last_used', '?'):19}  {r.get('turns', '?'):>3}t  "
+              f"{title:50}  {r.get('url', '')}")
+    return 0
 
 
 def cli_instances() -> int:

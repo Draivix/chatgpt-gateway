@@ -71,6 +71,60 @@ def _is_conversation_sse(resp) -> bool:
         return False
 
 
+# A ChatGPT conversation URL is https://chatgpt.com/c/<uuid>. Capture the id so a
+# later ask can navigate straight back to it ("returning to conversations").
+_CONV_ID_RE = re.compile(r"/c/([0-9a-fA-F-]{8,})")
+
+
+def _normalize_chat_ref(ref: str) -> str | None:
+    """Accept a full conversation URL or a bare id -> canonical https URL (or None)."""
+    ref = (ref or "").strip()
+    if not ref:
+        return None
+    m = _CONV_ID_RE.search(ref)
+    cid = m.group(1) if m else (ref if re.fullmatch(r"[0-9a-fA-F-]{8,}", ref) else None)
+    return f"{CHATGPT_NEW.rstrip('/')}/c/{cid}" if cid else None
+
+
+async def _conversation_id(page) -> str:
+    with contextlib.suppress(Exception):
+        m = _CONV_ID_RE.search(page.url or "")
+        if m:
+            return m.group(1)
+    return ""
+
+
+async def _conversation_title(page) -> str:
+    """Best-effort human title of the current conversation (browser tab title)."""
+    with contextlib.suppress(Exception):
+        t = (await page.title() or "").strip()
+        # ChatGPT tab title is the chat name (falls back to "ChatGPT" when unnamed).
+        if t and t.lower() != "chatgpt":
+            return t
+    return ""
+
+
+async def open_conversation(page, ref: str) -> bool:
+    """Navigate to an existing conversation by URL/id and wait for it to load.
+
+    Returns True if a conversation composer became available. The chat may still
+    be generating (opened while a prior turn streams) — callers that want the
+    settled answer should follow with ``_wait_complete``.
+    """
+    url = _normalize_chat_ref(ref)
+    if not url:
+        return False
+    await page.goto(url, wait_until="domcontentloaded")
+    try:
+        await page.wait_for_selector(SEL["composer"], timeout=20_000)
+    except Exception:
+        return False
+    # Give the message list a moment to hydrate (assistant turns load async).
+    with contextlib.suppress(Exception):
+        await page.wait_for_selector(SEL["assistant"], timeout=8000)
+    return True
+
+
 async def new_chat(page) -> None:
     try:
         btn = page.locator(SEL["new_chat"]).first
@@ -95,7 +149,13 @@ async def _escape(page, n: int = 2) -> None:
 
 
 async def _open_effort_menu(page) -> None:
-    await page.locator(SEL["composer"]).first.click()
+    # Dismiss any lingering menu/overlay first: in headed mode a still-open effort
+    # submenu from a prior attempt intercepts pointer events on the composer, and a
+    # bare click() then hangs for the full default timeout (~45s). Escape-first +
+    # a bounded click keeps a stuck attempt cheap instead of burning 45s each loop.
+    await _escape(page, 1)
+    with contextlib.suppress(Exception):
+        await page.locator(SEL["composer"]).first.click(timeout=8000)
     await page.keyboard.press("Control+Shift+m")
     await page.wait_for_timeout(700)
 
@@ -104,6 +164,36 @@ async def _open_effort_menu(page) -> None:
 # dropdown). Used to VERIFY a selection actually took (not just clicked a menu item).
 _EFFORT_LABELS = ["Okamžitá", "Střední", "Vysoká", "Velmi vysoká",
                   "Pro rozšířené", "Pro Standardní"]
+
+
+def _effort_target_label(effort: str) -> str | None:
+    """Toolbar indicator label that means ``effort`` is already active, or None for
+    an unknown/default effort (nothing specific to verify against)."""
+    effort = (effort or "").lower()
+    if effort in PRO_SUB:
+        return PRO_SUB[effort]        # "Pro rozšířené" / "Pro Standardní"
+    return EFFORT_MAP.get(effort)     # "Vysoká" etc., or None
+
+
+def _effort_satisfied(current: str, effort: str) -> bool:
+    """True if the composer's current effort indicator ``current`` already means
+    ``effort`` is selected, so set_effort can skip the fragile menu dance entirely.
+
+    Pure/decidable (no page) so it is unit-testable. The two Pro sub-modes both
+    start with "Pro", so they are disambiguated on their distinctive word rather
+    than a prefix match; plain levels require an exact label match to avoid the
+    "Vysoká" vs "Velmi vysoká" prefix trap.
+    """
+    target = _effort_target_label(effort)
+    if not target or not current:
+        return False
+    cur = current.strip().lower()
+    tgt = target.lower()
+    if tgt == "pro rozšířené":
+        return "rozšíř" in cur
+    if tgt == "pro standardní":
+        return "standard" in cur and "rozšíř" not in cur
+    return cur == tgt
 
 
 async def _current_effort_label(page) -> str:
@@ -128,6 +218,17 @@ async def set_effort(page, effort: str) -> str:
     """
     effort = (effort or "").lower()
     try:
+        # ── Fast path: the effort persists across chats in this profile, so the
+        # wanted level is usually ALREADY shown in the composer toolbar. Verify
+        # first and skip the menu entirely — this is the common case and avoids the
+        # fragile Ctrl+Shift+M dance (and its headed-mode click hang) altogether.
+        cur0 = await _current_effort_label(page)
+        if _effort_satisfied(cur0, effort):
+            log(f"effort already {cur0!r}; skipping menu")
+            if effort in PRO_SUB:
+                return f"Pro · {PRO_SUB[effort]}"
+            return EFFORT_MAP.get(effort, "default")
+
         # ── Pro modes: main "Pro" group + sub-intensity submenu ──
         if effort in PRO_SUB:
             sub = PRO_SUB[effort]  # e.g. "Pro rozšířené"
@@ -390,12 +491,20 @@ async def _attach_files(page, files: list[str], progress=None) -> int:
 async def ask(page, prompt: str, *, effort: str = "pro",
               system: str | None = None, timeout_s: int = 1200,
               progress=None, cont: bool = False,
-              files: list[str] | None = None) -> dict:
-    """Send a prompt and return {ok, text, model/effort, elapsed}. Serialized by daemon.
+              files: list[str] | None = None,
+              chat: str | None = None) -> dict:
+    """Send a prompt and return {ok, text, effort, elapsed, conversation_*}. Serialized.
 
     ``cont=True`` continues the CURRENT conversation (does not start a new chat),
     so prior turns stay in context. Multi-turn dialogue: first call cont=False,
     follow-ups cont=True. Either way only the latest assistant message is returned.
+
+    ``chat`` (URL or bare id) RESUMES a specific past conversation regardless of what
+    the tab currently shows — this is "returning to conversations". With ``chat`` set
+    and an empty ``prompt`` it is FETCH mode: reopen the chat and return its latest
+    answer (waiting if it is still generating) without sending anything. Every result
+    carries ``conversation_id`` / ``conversation_url`` / ``conversation_title`` so the
+    caller can persist where to return.
     """
     t0 = time.time()
     if not await is_logged_in(page):
@@ -408,8 +517,40 @@ async def ask(page, prompt: str, *, effort: str = "pro",
             except Exception:
                 pass
 
+    prompt = prompt or ""
+
+    async def _conv_fields():
+        cid = await _conversation_id(page)
+        return {
+            "conversation_id": cid,
+            "conversation_url": f"{CHATGPT_NEW.rstrip('/')}/c/{cid}" if cid else "",
+            "conversation_title": await _conversation_title(page),
+        }
+
     try:
-        if cont:
+        if chat:
+            # ── Resume a SPECIFIC past conversation (URL/id) ──
+            _p("opening conversation")
+            if not await open_conversation(page, chat):
+                return {"ok": False, "error": f"conversation not found: {chat}",
+                        "elapsed": round(time.time() - t0, 1)}
+            label = "resumed"
+            if not prompt.strip():
+                # FETCH mode: just return the latest answer (wait if still generating).
+                _p("fetching latest answer")
+                prior = await _count(page, SEL["assistant_md"])
+                if await _count(page, SEL["stop"]):
+                    await _wait_complete(page, timeout_s, _p, max(prior - 1, 0))
+                text = await _extract_latest(page)
+                elapsed = round(time.time() - t0, 1)
+                if not text:
+                    return {"ok": False, "error": "no answer in conversation",
+                            "elapsed": elapsed, **await _conv_fields()}
+                _p(f"fetched in {elapsed}s")
+                return {"ok": True, "text": text, "effort": label,
+                        "elapsed": elapsed, **await _conv_fields()}
+            # else: fall through and send the new prompt into this resumed chat.
+        elif cont:
             # Continue the existing conversation: ensure a composer is present
             # (do NOT reset the thread). Effort persists from the prior turn.
             _p("continuing conversation")
@@ -447,11 +588,12 @@ async def ask(page, prompt: str, *, effort: str = "pro",
             text = await _extract_latest(page)
         if not text:
             return {"ok": False, "error": "no response captured",
-                    "elapsed": round(time.time() - t0, 1)}
+                    "elapsed": round(time.time() - t0, 1), **await _conv_fields()}
 
         elapsed = round(time.time() - t0, 1)
         _p(f"done in {elapsed}s")
-        return {"ok": True, "text": text, "effort": label, "elapsed": elapsed}
+        return {"ok": True, "text": text, "effort": label,
+                "elapsed": elapsed, **await _conv_fields()}
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": f"{type(e).__name__}: {e}",
                 "elapsed": round(time.time() - t0, 1)}

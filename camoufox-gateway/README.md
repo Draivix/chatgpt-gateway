@@ -213,7 +213,8 @@ service* below.
 |---|---|
 | `cgw login [instance] [--account KEY] [--headed\|--headless] [--debug] [--no-addon] [--hold N]` | Log a persistent profile (named session) into chatgpt.com. `--hold N` = seconds to keep a headed window open for a manual finish. |
 | `cgw serve [instance] [--account KEY] [--port N] [--headed\|--headless] [--no-addon]` | Run the gateway daemon for one named instance. |
-| `cgw ask "<message>" [--instance NAME] [--effort LEVEL] [--timeout SECONDS] [--continue] [--file PATH …]` | One-shot ask via the running daemon. Prints the answer to stdout, progress to stderr. `--continue` keeps the instance's current conversation. `--file` attaches a local file (repeatable); paths are on the gateway host. |
+| `cgw ask "<message>" [--instance NAME] [--effort LEVEL] [--timeout SECONDS] [--continue] [--chat URL_OR_ID] [--file PATH …]` | One-shot ask via the running daemon. Prints the answer to stdout, progress to stderr. `--continue` keeps the instance's current conversation. `--chat` **resumes a specific past conversation** by URL/id (with no message, just fetches its latest answer). `--file` attaches a local file (repeatable); paths are on the gateway host. |
+| `cgw chats [--instance NAME] [--limit N]` | List recorded conversations you can resume (`last_used \| turns \| title \| url`). Reads the on-disk store even if the daemon is down. |
 | `cgw status [--instance NAME]` | Daemon health (JSON: instance, account, logged_in, busy, queued). |
 | `cgw instances` | List named instances (sessions) from the registry + each daemon's live state. |
 | `cgw accounts` | List account keys from your `accounts.json`. |
@@ -242,6 +243,21 @@ the composer's "＋" menu, so ChatGPT reads their contents — code, logs, data,
 resolve on the **gateway host** (where the daemon runs). From the MCP `chatgpt_ask` tool,
 pass `files: ["/abs/path.py", …]`.
 
+**Returning to conversations.** Chats are **not** one-shot. Every ask records the chat it
+touched to `~/.config/cgw/conversations.json` (id → url, title, turns, last_used,
+instance), so a *new* client/agent can look up and re-enter a thread it never saw created:
+
+```bash
+cgw chats                                     # list resumable conversations
+cgw ask --chat <url|id> "follow-up prompt"    # reopen that chat, keep full context
+cgw ask --chat <url|id>                       # fetch mode: just read its latest answer
+```
+
+`--continue` only tracks the tab's *current* chat and resets on daemon restart; `--chat`
++ the on-disk store are the **durable** resume path (survive restarts). The store is the
+source of truth and `cgw chats` reads it even when the daemon is down; ChatGPT also keeps
+every chat server-side, so a URL is always re-openable in a headed window.
+
 ---
 
 ## Reasoning effort levels
@@ -267,12 +283,13 @@ Pro/Pro-Extended answers can take **minutes** — that's expected; the default t
 
 ## Use from Claude Code (skill + MCP)
 
-**Skill** (optional convenience): a `chatgpt-pro` skill that tells Claude how/when to use
-the tools. Copy it into your skills dir, adjusting paths/accounts to your setup:
+**Skill** (optional convenience): a ready-made `chatgpt-pro` skill ships in this repo at
+[`skills/chatgpt-pro/SKILL.md`](skills/chatgpt-pro/SKILL.md) — it tells an agent how/when
+to use the tools (including conversation resume). Install it by copying it into your
+skills dir:
 
 ```bash
-mkdir -p ~/.claude/skills/chatgpt-pro
-$EDITOR ~/.claude/skills/chatgpt-pro/SKILL.md
+cp -r skills/chatgpt-pro ~/.claude/skills/     # from camoufox-gateway/
 ```
 
 **MCP server** — register it in your Claude Code MCP config (commonly
@@ -292,10 +309,15 @@ $EDITOR ~/.claude/skills/chatgpt-pro/SKILL.md
 Restart Claude Code. Tools exposed:
 
 - `chatgpt_status` — is the gateway up and logged in? (call first)
-- `chatgpt_ask(message, effort="pro", timeout=1200, system=None)` — ask and get the
-  answer; polls to completion and reports progress.
+- `chatgpt_ask(message, effort="pro", timeout=1200, system=None, instance=…, cont=False,
+  chat=None, files=None)` — ask and get the answer; polls to completion and reports
+  progress. `chat` (URL/id) **resumes a past conversation** (empty `message` = fetch its
+  latest answer); the answer carries a `⟨conversation: URL⟩` footer to persist.
 - `chatgpt_poll(job_id)` — check a long job already submitted.
 - `chatgpt_login()` — trigger a headless re-login.
+- `chatgpt_instances()` — list named sessions and whether each daemon is up.
+- `chatgpt_conversations()` — list recorded conversations to resume (see *Returning to
+  conversations* above).
 
 The MCP server is a thin client — the **daemon must be running** (`cgw serve` or the
 systemd unit). `chatgpt_status` tells you if it isn't.

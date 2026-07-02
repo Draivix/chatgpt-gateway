@@ -100,14 +100,27 @@ class Gateway:
                         page, job["message"], effort=job["effort"],
                         system=job.get("system"), timeout_s=job["timeout"], progress=prog,
                         cont=job.get("cont", False), files=job.get("files"),
+                        chat=job.get("chat"),
                     ),
                     timeout=job["timeout"] + 90,
                 )
+                conv = {k: res.get(k) for k in
+                        ("conversation_id", "conversation_url", "conversation_title")}
+                # Remember where this conversation lives so a NEW client/agent can
+                # resume it later ("returning to conversations").
+                if res.get("conversation_id"):
+                    with contextlib.suppress(Exception):
+                        config.record_conversation(
+                            res["conversation_id"],
+                            url=res.get("conversation_url"),
+                            title=res.get("conversation_title"),
+                            instance=self.instance, account=self.account,
+                            effort=job.get("effort"))
                 if res.get("ok"):
                     job.update(status="done", text=res["text"],
-                               model=res.get("model"), elapsed=res.get("elapsed"))
+                               model=res.get("model"), elapsed=res.get("elapsed"), **conv)
                 else:
-                    job.update(status="error", error=res.get("error", "unknown"))
+                    job.update(status="error", error=res.get("error", "unknown"), **conv)
             except asyncio.TimeoutError:
                 job.update(status="error", error="watchdog timeout")
                 await self._recover(page)
@@ -149,13 +162,19 @@ async def _h_ask(request: web.Request) -> web.Response:
     gw: Gateway = request.app["gw"]
     data = await request.json()
     msg = (data.get("message") or "").strip()
-    if not msg:
+    chat_ref = (data.get("chat") or "").strip() or None
+    # An empty message is allowed ONLY in fetch mode (resume a chat, return its
+    # latest answer). Otherwise a prompt is required.
+    if not msg and not chat_ref:
         return web.json_response({"error": "message required"}, status=400)
     jid = uuid.uuid4().hex[:12]
     cont = bool(data.get("continue"))
     files = data.get("files") or None
     if files is not None and not isinstance(files, list):
         return web.json_response({"error": "files must be a list of paths"}, status=400)
+    # Resume jobs are pinned to worker 0's tab (like --continue) so the reopened
+    # conversation is not fighting a one-shot job for the same window.
+    pin = cont or bool(chat_ref)
     gw.jobs[jid] = {
         "status": "queued", "progress": "queued",
         "message": msg,
@@ -163,11 +182,19 @@ async def _h_ask(request: web.Request) -> web.Response:
         "system": data.get("system"),
         "timeout": int(data.get("timeout") or config.ASK_TIMEOUT_S),
         "cont": cont,
+        "chat": chat_ref,
         "files": files,
     }
-    await (gw.cont_queue if cont else gw.queue).put(jid)
+    await (gw.cont_queue if pin else gw.queue).put(jid)
     return web.json_response(
         {"job_id": jid, "queued": gw.queue.qsize() + gw.cont_queue.qsize()})
+
+
+async def _h_conversations(request: web.Request) -> web.Response:
+    """List recorded conversations (newest-used first) so a client can resume one."""
+    convs = list(config.load_conversations().values())
+    convs.sort(key=lambda r: r.get("last_used_at", 0), reverse=True)
+    return web.json_response({"conversations": convs})
 
 
 async def _h_job(request: web.Request) -> web.Response:
@@ -175,7 +202,9 @@ async def _h_job(request: web.Request) -> web.Response:
     job = gw.jobs.get(request.match_info["jid"])
     if not job:
         return web.json_response({"error": "unknown job"}, status=404)
-    out = {k: job.get(k) for k in ("status", "progress", "text", "error", "model", "elapsed", "worker")}
+    out = {k: job.get(k) for k in (
+        "status", "progress", "text", "error", "model", "elapsed", "worker",
+        "conversation_id", "conversation_url", "conversation_title")}
     return web.json_response(out)
 
 
@@ -226,6 +255,7 @@ async def _serve(instance: str, account: str, port: int, headed: bool, with_addo
             web.get("/health", _h_health),
             web.post("/ask", _h_ask),
             web.get("/jobs/{jid}", _h_job),
+            web.get("/conversations", _h_conversations),
             web.post("/login", _h_login),
         ])
         runner = web.AppRunner(app)

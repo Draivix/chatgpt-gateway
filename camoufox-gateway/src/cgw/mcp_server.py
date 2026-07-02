@@ -1,7 +1,10 @@
 """stdio MCP server exposing the ChatGPT-Pro gateway as tools.
 
 Thin client over the daemon's loopback HTTP API. Usable from Claude Code and codex.
-Tools: chatgpt_status, chatgpt_ask, chatgpt_poll, chatgpt_login, chatgpt_instances.
+Tools: chatgpt_status, chatgpt_ask, chatgpt_poll, chatgpt_login, chatgpt_instances,
+chatgpt_conversations. chatgpt_ask can RESUME a past conversation via its ``chat``
+arg, and every answer footer carries the conversation URL so an agent can persist
+where to return later.
 
 Every tool takes an ``instance`` (named session) so several Pro conversations on
 separate Camoufox profiles/daemons can be driven in parallel; it defaults to the
@@ -98,13 +101,14 @@ async def chatgpt_status(instance: str = config.DEFAULT_INSTANCE) -> str:
 
 @mcp.tool()
 async def chatgpt_ask(
-    message: str,
+    message: str = "",
     effort: str = "pro",
     timeout: int = 1200,
     system: str | None = None,
     instance: str = config.DEFAULT_INSTANCE,
     cont: bool = False,
     files: list[str] | None = None,
+    chat: str | None = None,
     ctx: Context | None = None,
 ) -> str:
     """Ask ChatGPT Pro and return its answer (markdown).
@@ -115,8 +119,11 @@ async def chatgpt_ask(
     instance: which named session to ask — run separate Pro conversations in parallel
     by pointing different calls at different instances (see chatgpt_instances).
     cont=True continues that instance's current conversation instead of starting fresh.
+    chat: RESUME a specific past conversation by URL or id (see chatgpt_conversations).
+    With ``chat`` set and an empty ``message`` it just fetches that chat's latest answer.
     files: local file paths (on the gateway host) to attach to the message — e.g. code
     files for ChatGPT to read/review. Each call otherwise starts a new conversation.
+    The answer ends with a '⟨conversation: URL⟩' footer so you can resume it later.
     Polls until complete; reports progress.
     """
     try:
@@ -126,7 +133,8 @@ async def chatgpt_ask(
     try:
         job, status = await _post(base, "/ask", {"message": message, "effort": effort,
                                                  "timeout": timeout, "system": system,
-                                                 "continue": cont, "files": files})
+                                                 "continue": cont, "files": files,
+                                                 "chat": chat})
     except Exception:
         return _down(instance, base)
     if status != 200:
@@ -149,11 +157,41 @@ async def chatgpt_ask(
                 await ctx.info(f"chatgpt: {prog}")
             except Exception:
                 pass
-        if st.get("status") == "done":
-            return st.get("text", "")
-        if st.get("status") == "error":
-            return f"ChatGPT request failed: {st.get('error')}"
+        if st.get("status") in ("done", "error"):
+            url = st.get("conversation_url")
+            footer = f"\n\n⟨conversation: {url}⟩" if url else ""
+            if st.get("status") == "done":
+                return st.get("text", "") + footer
+            return f"ChatGPT request failed: {st.get('error')}{footer}"
     return f"Timed out after {timeout}s waiting for ChatGPT (job {jid} still running)."
+
+
+@mcp.tool()
+async def chatgpt_conversations(
+    instance: str = config.DEFAULT_INSTANCE, limit: int = 30
+) -> str:
+    """List recorded ChatGPT conversations (newest first) that you can RESUME.
+
+    Each row is 'last_used | turns | title | url'. Pass a url (or its id) as the
+    ``chat`` arg of chatgpt_ask to reopen that conversation with full prior context,
+    or with an empty message to just re-read its latest answer. This is how a fresh
+    agent/session finds where to return without remembering it in-band.
+    """
+    try:
+        base = _base(instance)
+        data, _ = await _get(base, "/conversations")
+        convs = data.get("conversations", [])
+    except Exception:
+        # Daemon down / unknown instance: read the on-disk store directly.
+        convs = sorted(config.load_conversations().values(),
+                       key=lambda r: r.get("last_used_at", 0), reverse=True)
+    convs = convs[:limit]
+    if not convs:
+        return "No conversations recorded yet."
+    return "\n".join(
+        f"{r.get('last_used', '?')} | {r.get('turns', '?')}t | "
+        f"{(r.get('title') or '(untitled)')[:48]} | {r.get('url', '')}"
+        for r in convs)
 
 
 @mcp.tool()

@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import time
 from pathlib import Path
 
 # camoufox-gateway/src/cgw/config.py -> repo = chatgpt-gateway/
@@ -43,6 +44,15 @@ DEFAULT_INSTANCE = os.environ.get("CGW_INSTANCE", DEFAULT_ACCOUNT)
 STATE_DIR = Path(os.environ.get("CGW_STATE_DIR", str(Path.home() / ".config" / "cgw")))
 INSTANCES_FILE = Path(
     os.environ.get("CGW_INSTANCES_FILE", str(STATE_DIR / "instances.json")))
+
+# Durable record of ChatGPT conversations this gateway has driven (id -> record),
+# so a *new* client/agent can look up a past chat's URL and RESUME it instead of
+# starting fresh. This is the "returning to conversations" memory: every ask upserts
+# the conversation it touched here. Override path with CGW_CONVERSATIONS_FILE.
+CONVERSATIONS_FILE = Path(
+    os.environ.get("CGW_CONVERSATIONS_FILE", str(STATE_DIR / "conversations.json")))
+# Keep the store bounded (most-recently-used wins).
+CONVERSATIONS_MAX = int(os.environ.get("CGW_CONVERSATIONS_MAX", "300"))
 
 
 def _envbool(name: str, default: bool = False) -> bool:
@@ -200,3 +210,71 @@ def instance_port(instance: str) -> int | None:
     if instance == DEFAULT_INSTANCE:
         return DAEMON_PORT
     return None
+
+
+# ── Conversation memory (id -> {url, title, instance, ...}) ───────────────────
+
+def conversation_url(conv_id: str) -> str:
+    return f"{CHATGPT_URL.rstrip('/')}/c/{conv_id}"
+
+
+def load_conversations() -> dict:
+    """All recorded conversations, newest-touched first is NOT guaranteed here —
+    callers sort by ``last_used_at`` if they need ordering."""
+    try:
+        with CONVERSATIONS_FILE.open() as f:
+            return json.load(f).get("conversations", {})
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def record_conversation(conv_id: str, *, url: str | None = None,
+                        title: str | None = None, instance: str | None = None,
+                        account: str | None = None, effort: str | None = None) -> None:
+    """Upsert one conversation into the durable store (cross-process locked).
+
+    Idempotent per id: first sighting stamps ``created_at`` + ``turns=1``; later
+    asks bump ``last_used_at`` + ``turns`` and refresh the mutable fields. Best
+    effort — a broken/locked store must never fail an ask, so callers suppress.
+    """
+    if not conv_id:
+        return
+    CONVERSATIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    lock = CONVERSATIONS_FILE.with_suffix(".lock")
+    now = time.time()
+    with lock.open("w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            convs = load_conversations()
+            rec = convs.get(conv_id, {})
+            rec.update({
+                "id": conv_id,
+                "url": url or rec.get("url") or conversation_url(conv_id),
+                "last_used_at": now,
+                "last_used": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+                "turns": int(rec.get("turns", 0)) + 1,
+            })
+            if title:
+                rec["title"] = title
+            if instance:
+                rec["instance"] = instance
+            if account:
+                rec["account"] = account
+            if effort:
+                rec["effort"] = effort
+            rec.setdefault("created_at", now)
+            rec.setdefault("created",
+                           time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)))
+            convs[conv_id] = rec
+            # Bound the store: drop the least-recently-used beyond the cap.
+            if len(convs) > CONVERSATIONS_MAX:
+                keep = sorted(convs.values(),
+                              key=lambda r: r.get("last_used_at", 0),
+                              reverse=True)[:CONVERSATIONS_MAX]
+                convs = {r["id"]: r for r in keep}
+            tmp = CONVERSATIONS_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"conversations": convs}, indent=2,
+                                      ensure_ascii=False))
+            tmp.replace(CONVERSATIONS_FILE)
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
